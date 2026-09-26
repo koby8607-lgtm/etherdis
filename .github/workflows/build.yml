@@ -1,83 +1,239 @@
-name: Build USB0 Manager v1.7
+name: Build USB0 Manager
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main, master]
-    tags: ['v*']
+    branches:
+      - main
+      - master
+      - "**"
   pull_request:
-    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    runs-on: ubuntu-24.04
 
-      - name: Set up JDK 17
+    env:
+      ANDROID_API_LEVEL: "35"
+      ANDROID_BUILD_TOOLS: "35.0.0"
+      ANDROID_NDK_VERSION: "27.2.12479018"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;27.2.12479018
 
-      - name: Install Android SDK/NDK
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
-
-      - name: Build private ARM64 networking engine
+      - name: Verify Android SDK
         shell: bash
         run: |
           set -euo pipefail
-          NDK="$ANDROID_HOME/ndk/27.2.12479018"
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
-          chmod +x "$CLANG"
-          "$CLANG" -O2 -fPIE -pie -DANDROID app/src/main/cpp/usb0-native.c \
-            -o app/src/main/assets/tools/arm64-v8a/usb0-native
-          file app/src/main/assets/tools/arm64-v8a/usb0-native
-          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
+          sdkmanager --version
+          adb version
+          test -d "${ANDROID_SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
+          test -d "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
+          test -d "${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
 
-      - name: Build ARM64 helper launcher
+      - name: Prepare Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
-          NDK="$ANDROID_HOME/ndk/27.2.12479018"
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
-          "$CLANG" -O2 -fPIE -pie -DANDROID app/src/main/cpp/usb0-helper.c \
-            -o app/src/main/assets/tools/arm64-v8a/usb0-helper
-          file app/src/main/assets/tools/arm64-v8a/usb0-helper
-          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-helper
 
-      - name: Verify bundled tools are present
+          if [[ ! -f ./gradlew ]]; then
+            echo "ERROR: gradlew not found"
+            exit 1
+          fi
+
+          chmod 755 ./gradlew
+
+          if ! head -n 1 ./gradlew | grep -q '^#!/'; then
+            echo "ERROR: gradlew does not appear to be a valid shell script"
+            exit 1
+          fi
+
+          test -r ./gradlew
+          test -x ./gradlew
+
+      - name: Check Gradle wrapper
+        shell: bash
         run: |
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-native
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper.sh
-          test -s app/src/main/assets/r36s/lineageos_r36s_defconfig.txt
-          test -s app/src/main/assets/r36s/kernel-capabilities.txt
+          set -euo pipefail
+          bash ./gradlew --version
 
-      - name: Build debug and release
-        run: ./gradlew assembleDebug assembleRelease --no-daemon
+      - name: Detect Android project
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - uses: actions/upload-artifact@v4
+          if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
+            echo "ERROR: No Gradle settings file found"
+            exit 1
+          fi
+
+          if [[ ! -f build.gradle && ! -f build.gradle.kts ]]; then
+            echo "ERROR: No root Gradle build file found"
+            exit 1
+          fi
+
+      - name: Verify ARM64 native source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -d app/src/main/cpp ]]; then
+            find app/src/main/cpp -type f \
+              \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) \
+              -print
+          fi
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./gradlew clean assembleDebug --no-daemon --stacktrace
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Locate APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          mapfile -t APK_FILES < <(
+            find . \
+              -type f \
+              -path '*/build/outputs/apk/*.apk' \
+              -print
+          )
+
+          if [[ ${#APK_FILES[@]} -eq 0 ]]; then
+            echo "ERROR: No APK files were produced"
+            find . -type f -path '*/build/outputs/*' -print || true
+            exit 1
+          fi
+
+          for apk in "${APK_FILES[@]}"; do
+            echo "Found APK: ${apk}"
+            cp "${apk}" artifacts/
+          done
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: usb0-manager-v1.7
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+          name: usb0-manager-apks
+          path: artifacts/*.apk
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Publish release APK on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  validate:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
+            bash -n "${file}"
+          done < <(
+            find . \
+              -type f \
+              \( -name '*.sh' -o -name '*.bash' \) \
+              -not -path './.git/*' \
+              -print0
+          )
+
+      - name: Validate workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f .github/workflows/build.yml || {
+            echo "WARNING: expected workflow filename .github/workflows/build.yml not found"
+            exit 0
+          }
+
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          p = pathlib.Path(".github/workflows/build.yml")
+          text = p.read_text(encoding="utf-8")
+
+          if "\n      - name: Set up Android SDK\n" not in text:
+              print("ERROR: Android SDK setup step missing")
+              sys.exit(1)
+
+          if "packages: tools" in text or "tools\n" in text:
+              print("ERROR: obsolete Android SDK 'tools' package detected")
+              sys.exit(1)
+
+          if "./gradlew" not in text:
+              print("ERROR: Gradle wrapper invocation missing")
+              sys.exit(1)
+
+          print("Workflow checks passed")
+          PY
+
+      - name: Verify Gradle wrapper permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f ./gradlew
+          chmod 755 ./gradlew
+          test -x ./gradlew
+
+      - name: Check for obsolete SDK package request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RniE \
+            --exclude-dir=.git \
+            --exclude='*.md' \
+            -E 'sdkmanager.*\btools\b|packages:.*\btools\b|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
+            .github 2>/dev/null; then
+            echo "ERROR: obsolete Android SDK package 'tools' requested"
+            exit 1
+          fi
+
+      - name: Upload workflow logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: workflow-debug
+          path: |
+            ~/.gradle/daemon/**/*
+            ~/.gradle/caches/**/*
+          if-no-files-found: ignore
+          retention-days: 7
