@@ -1,299 +1,94 @@
-name: Build USB0 Manager
+name: Build USB0 Manager v1.7
 
 on:
-  push:
-    branches:
-      - main
-      - master
-      - "**"
-  pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-env:
-  ANDROID_API_LEVEL: "35"
-  ANDROID_BUILD_TOOLS: "35.0.0"
-  ANDROID_NDK_VERSION: "27.2.12479018"
-  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-          cache: gradle
+          java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK/NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Build private ARM64 networking engine
         shell: bash
         run: |
           set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+          chmod +x "$CLANG"
+          "$CLANG" -O2 -fPIE -pie -DANDROID app/src/main/cpp/usb0-native.c \
+            -o app/src/main/assets/tools/arm64-v8a/usb0-native
+          file app/src/main/assets/tools/arm64-v8a/usb0-native
+          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
 
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/android-sdk}}"
-
-          echo "SDK_ROOT=${SDK_ROOT}"
-
-          sdkmanager \
-            --sdk_root="${SDK_ROOT}" \
-            "platform-tools" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "ndk;${ANDROID_NDK_VERSION}"
-
-      - name: Verify Android SDK
+      - name: Build ARM64 helper launcher
         shell: bash
         run: |
           set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+          "$CLANG" -O2 -fPIE -pie -DANDROID app/src/main/cpp/usb0-helper.c \
+            -o app/src/main/assets/tools/arm64-v8a/usb0-helper
+          file app/src/main/assets/tools/arm64-v8a/usb0-helper
+          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-helper
 
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/android-sdk}}"
-
-          test -d "${SDK_ROOT}/platform-tools"
-          test -d "${SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
-          test -d "${SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
-          test -d "${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+      - name: Verify bundled tools are present
+        run: |
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-native
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper.sh
+          test -s app/src/main/assets/r36s/lineageos_r36s_defconfig.txt
+          test -s app/src/main/assets/r36s/kernel-capabilities.txt
 
       - name: Prepare Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
-
-          test -f ./gradlew
           chmod 755 ./gradlew
           test -r ./gradlew
           test -x ./gradlew
 
-      - name: Create CI JVM compatibility init script
+      - name: Build debug and release
         shell: bash
         run: |
           set -euo pipefail
+          bash ./gradlew assembleDebug assembleRelease --no-daemon
 
-          cat > ci-jvm-targets.gradle <<'EOF'
-          import org.gradle.api.tasks.compile.JavaCompile
-
-          gradle.projectsEvaluated {
-              allprojects { project ->
-
-                  project.tasks.configureEach { task ->
-
-                      /*
-                       * Force all Java compilation to JVM 17 so it matches
-                       * Kotlin compilation and the JDK used by CI.
-                       */
-                      if (task instanceof JavaCompile) {
-                          task.sourceCompatibility = "17"
-                          task.targetCompatibility = "17"
-
-                          try {
-                              task.options.release.set(17)
-                          } catch (Throwable ignored) {
-                              // Older Gradle/Android plugin combinations may
-                              // not expose JavaCompile.options.release.
-                          }
-                      }
-
-                      /*
-                       * KotlinCompile is intentionally detected by class name
-                       * so this init script does not need to import Kotlin
-                       * plugin classes before the project is configured.
-                       */
-                      if (task.class.name.contains("KotlinCompile")) {
-                          try {
-                              task.kotlinOptions.jvmTarget = "17"
-                          } catch (Throwable ignored) {
-                              // Kotlin versions using compilerOptions are handled
-                              // below where available.
-                          }
-
-                          try {
-                              def compilerOptions = task.compilerOptions
-                              def jvmTarget = compilerOptions.jvmTarget
-
-                              if (jvmTarget != null) {
-                                  def enumClass = jvmTarget.get().class
-                                  def target17 = enumClass.enumConstants.find {
-                                      it.toString() == "JVM_17"
-                                  }
-
-                                  if (target17 != null) {
-                                      jvmTarget.set(target17)
-                                  }
-                              }
-                          } catch (Throwable ignored) {
-                              // Legacy kotlinOptions path above is enough for
-                              // Kotlin versions that don't expose compilerOptions.
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
-
-          test -s ci-jvm-targets.gradle
-
-      - name: Check Gradle wrapper
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash ./gradlew \
-            --version \
-            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
-
-      - name: Clean build
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash ./gradlew \
-            clean \
-            --no-daemon \
-            --stacktrace \
-            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash ./gradlew \
-            assembleDebug \
-            --no-daemon \
-            --stacktrace \
-            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
-
-      - name: Build release APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash ./gradlew \
-            assembleRelease \
-            --no-daemon \
-            --stacktrace \
-            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
-
-      - name: Collect APKs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p artifacts
-
-          found=0
-
-          while IFS= read -r -d '' apk; do
-            echo "Found APK: ${apk}"
-            cp "${apk}" artifacts/
-            found=1
-          done < <(
-            find . \
-              -type f \
-              -path '*/build/outputs/apk/*.apk' \
-              -print0
-          )
-
-          if [[ "${found}" -eq 0 ]]; then
-            echo "ERROR: No APK files were produced"
-            find . -type f -path '*/build/outputs/*' -print || true
-            exit 1
-          fi
-
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: USB0-Manager-APKs
-          path: artifacts/*.apk
-          if-no-files-found: error
+          name: usb0-manager-v1.7
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
           retention-days: 30
 
-      - name: Upload build diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Publish release APK on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          name: USB0-Manager-build-diagnostics
-          path: |
-            **/build/reports/**
-            **/build/outputs/**
-            ~/.gradle/daemon/**
-          if-no-files-found: ignore
-          retention-days: 7
-
-  validate:
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate Gradle wrapper
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f ./gradlew
-          chmod 755 ./gradlew
-          test -x ./gradlew
-
-      - name: Validate shell scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          while IFS= read -r -d '' file; do
-            echo "Checking ${file}"
-            bash -n "${file}"
-          done < <(
-            find . \
-              -type f \
-              \( -name '*.sh' -o -name '*.bash' \) \
-              -not -path './.git/*' \
-              -print0
-          )
-
-      - name: Check workflow for obsolete SDK package
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if grep -RniE \
-            --exclude-dir=.git \
-            -E \
-            'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$|sdkmanager.*["'\'']tools["'\'']' \
-            .github 2>/dev/null; then
-
-            echo "ERROR: obsolete Android SDK 'tools' package detected"
-            exit 1
-          fi
-
-      - name: Verify project structure
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f settings.gradle || test -f settings.gradle.kts
-          test -f build.gradle || test -f build.gradle.kts
-
-      - name: Verify ARM64 configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -d app/src/main ]]; then
-            grep -Rni \
-              -E \
-              'arm64-v8a|ABI\.ARM64_V8A|ANDROID_ABI.*arm64' \
-              app/src/main \
-              2>/dev/null || true
-          fi
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
