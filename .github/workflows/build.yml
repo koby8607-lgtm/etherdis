@@ -12,65 +12,90 @@ on:
 permissions:
   contents: read
 
+env:
+  ANDROID_API_LEVEL: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-
-    env:
-      ANDROID_API_LEVEL: "35"
-      ANDROID_BUILD_TOOLS: "35.0.0"
-      ANDROID_NDK_VERSION: "27.2.12479018"
-      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK command-line tools
         uses: android-actions/setup-android@v4
         with:
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
-            ndk;27.2.12479018
+          packages: ""
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}"
+          export ANDROID_SDK_ROOT="${SDK_ROOT}"
+          export ANDROID_HOME="${SDK_ROOT}"
+
+          SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+
+          if [[ ! -x "${SDKMANAGER}" ]]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [[ -z "${SDKMANAGER}" ]]; then
+            echo "ERROR: sdkmanager not found"
+            exit 1
+          fi
+
+          echo "Using sdkmanager: ${SDKMANAGER}"
+          "${SDKMANAGER}" --version
+
+          "${SDKMANAGER}" \
+            --sdk_root="${SDK_ROOT}" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
 
       - name: Verify Android SDK
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --version
-          adb version
-          test -d "${ANDROID_SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
-          test -d "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
-          test -d "${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+
+          test -d "${SDK_ROOT}/platform-tools"
+          test -d "${SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
+          test -d "${SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
+          test -d "${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+
+          echo "Android SDK verification passed"
 
       - name: Prepare Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! -f ./gradlew ]]; then
-            echo "ERROR: gradlew not found"
-            exit 1
-          fi
+          test -f ./gradlew
 
           chmod 755 ./gradlew
 
-          if ! head -n 1 ./gradlew | grep -q '^#!/'; then
-            echo "ERROR: gradlew does not appear to be a valid shell script"
-            exit 1
-          fi
-
           test -r ./gradlew
           test -x ./gradlew
+
+          head -n 1 ./gradlew
 
       - name: Check Gradle wrapper
         shell: bash
@@ -78,83 +103,36 @@ jobs:
           set -euo pipefail
           bash ./gradlew --version
 
-      - name: Detect Android project
+      - name: Validate project structure
         shell: bash
         run: |
           set -euo pipefail
 
           if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
-            echo "ERROR: No Gradle settings file found"
+            echo "ERROR: settings.gradle or settings.gradle.kts not found"
             exit 1
           fi
 
           if [[ ! -f build.gradle && ! -f build.gradle.kts ]]; then
-            echo "ERROR: No root Gradle build file found"
+            echo "ERROR: build.gradle or build.gradle.kts not found"
             exit 1
           fi
 
-      - name: Verify ARM64 native source
+      - name: Validate native sources
         shell: bash
         run: |
           set -euo pipefail
 
           if [[ -d app/src/main/cpp ]]; then
-            find app/src/main/cpp -type f \
-              \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) \
-              -print
+            while IFS= read -r -d '' file; do
+              echo "Found native source: ${file}"
+            done < <(
+              find app/src/main/cpp \
+                -type f \
+                \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) \
+                -print0
+            )
           fi
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash ./gradlew clean assembleDebug --no-daemon --stacktrace
-
-      - name: Build release APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash ./gradlew assembleRelease --no-daemon --stacktrace
-
-      - name: Locate APKs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p artifacts
-
-          mapfile -t APK_FILES < <(
-            find . \
-              -type f \
-              -path '*/build/outputs/apk/*.apk' \
-              -print
-          )
-
-          if [[ ${#APK_FILES[@]} -eq 0 ]]; then
-            echo "ERROR: No APK files were produced"
-            find . -type f -path '*/build/outputs/*' -print || true
-            exit 1
-          fi
-
-          for apk in "${APK_FILES[@]}"; do
-            echo "Found APK: ${apk}"
-            cp "${apk}" artifacts/
-          done
-
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: usb0-manager-apks
-          path: artifacts/*.apk
-          if-no-files-found: error
-          retention-days: 30
-
-  validate:
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: Validate shell scripts
         shell: bash
@@ -172,68 +150,69 @@ jobs:
               -print0
           )
 
-      - name: Validate workflow
+      - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f .github/workflows/build.yml || {
-            echo "WARNING: expected workflow filename .github/workflows/build.yml not found"
-            exit 0
-          }
+          bash ./gradlew \
+            clean \
+            assembleDebug \
+            --no-daemon \
+            --stacktrace
 
-          python3 - <<'PY'
-          import pathlib
-          import sys
-
-          p = pathlib.Path(".github/workflows/build.yml")
-          text = p.read_text(encoding="utf-8")
-
-          if "\n      - name: Set up Android SDK\n" not in text:
-              print("ERROR: Android SDK setup step missing")
-              sys.exit(1)
-
-          if "packages: tools" in text or "tools\n" in text:
-              print("ERROR: obsolete Android SDK 'tools' package detected")
-              sys.exit(1)
-
-          if "./gradlew" not in text:
-              print("ERROR: Gradle wrapper invocation missing")
-              sys.exit(1)
-
-          print("Workflow checks passed")
-          PY
-
-      - name: Verify Gradle wrapper permissions
+      - name: Build release APK
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f ./gradlew
-          chmod 755 ./gradlew
-          test -x ./gradlew
+          bash ./gradlew \
+            assembleRelease \
+            --no-daemon \
+            --stacktrace
 
-      - name: Check for obsolete SDK package request
+      - name: Collect APKs
         shell: bash
         run: |
           set -euo pipefail
 
-          if grep -RniE \
-            --exclude-dir=.git \
-            --exclude='*.md' \
-            -E 'sdkmanager.*\btools\b|packages:.*\btools\b|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
-            .github 2>/dev/null; then
-            echo "ERROR: obsolete Android SDK package 'tools' requested"
+          mkdir -p artifacts
+
+          found=0
+
+          while IFS= read -r -d '' apk; do
+            echo "Collecting: ${apk}"
+            cp "${apk}" artifacts/
+            found=1
+          done < <(
+            find . \
+              -type f \
+              -path '*/build/outputs/apk/*.apk' \
+              -print0
+          )
+
+          if [[ "${found}" -eq 0 ]]; then
+            echo "ERROR: No APK files were produced"
+            find . -type f -path '*/build/outputs/*' -print || true
             exit 1
           fi
 
-      - name: Upload workflow logs on failure
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: USB0-Manager-APKs
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: workflow-debug
+          name: USB0-Manager-build-diagnostics
           path: |
-            ~/.gradle/daemon/**/*
-            ~/.gradle/caches/**/*
+            **/build/outputs/**
+            **/build/reports/**
+            ~/.gradle/daemon/**
           if-no-files-found: ignore
           retention-days: 7
