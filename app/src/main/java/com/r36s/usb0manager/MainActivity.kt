@@ -68,7 +68,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             val input = EditText(this@MainActivity).apply {
                 hint = "status / driver-info / driver-fallback / usb-reset"
-                singleLine = true
+                isSingleLine = true
                 layoutParams = LinearLayout.LayoutParams(0, -2, 2.4f)
             }
             val run = Button(this@MainActivity).apply {
@@ -184,18 +184,23 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun runRoot(command: String): String = try {
-        val tokens = command.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (tokens.isEmpty()) return ""
-        val safe = tokens.joinToString(" ") { token -> "'${token.replace("'", "'\\''")}'" }
-        val helperQ = "'${helper.absolutePath.replace("'", "'\\''")}'"
-        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "$helperQ $safe"))
-        val stdout = p.inputStream.bufferedReader().readText()
-        val stderr = p.errorStream.bufferedReader().readText()
-        p.waitFor()
-        stdout + if (stderr.isNotBlank()) "\n[stderr]\n$stderr" else ""
-    } catch (e: Exception) {
-        "ROOT ERROR: ${e.message}"
+    private fun runRoot(command: String): String {
+        return try {
+            val tokens = command.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+            if (tokens.isEmpty()) {
+                ""
+            } else {
+                val safe = tokens.joinToString(" ") { token -> "'${token.replace("'", "'\\''")}'" }
+                val helperQ = "'${helper.absolutePath.replace("'", "'\\''")}'"
+                val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "$helperQ $safe"))
+                val stdout = p.inputStream.bufferedReader().readText()
+                val stderr = p.errorStream.bufferedReader().readText()
+                p.waitFor()
+                stdout + if (stderr.isNotBlank()) "\n[stderr]\n$stderr" else ""
+            }
+        } catch (e: Exception) {
+            "ROOT ERROR: ${e.message}"
+        }
     }
 
     private fun refresh() {

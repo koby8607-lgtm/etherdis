@@ -7,8 +7,8 @@ android {
         applicationId 'com.r36s.usb0manager'
         minSdk 30
         targetSdk 30
-        versionCode 8
-        versionName '1.7.0'
+        versionCode 9
+        versionName '1.7.1'
     }
     buildFeatures { buildConfig true }
     packaging { resources { excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*'] } }

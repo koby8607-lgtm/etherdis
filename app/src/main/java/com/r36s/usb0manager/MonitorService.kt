@@ -117,7 +117,7 @@ class MonitorService : Service() {
 
     private fun notification(text: String): Notification =
         NotificationCompat.Builder(this, "usb0")
-            .setSmallIcon(android.R.drawable.stat_sys_data_usb)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("USB0 Manager")
             .setContentText(text.take(120))
             .setOngoing(true)

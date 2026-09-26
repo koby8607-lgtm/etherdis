@@ -106,3 +106,7 @@ The current R36S kernel has PPP core, MPPE and PPTP enabled, but its defconfig d
 PPP Widget 3 documented two ideas that are useful here: automatic USB modem/interface detection and connection logging, with support for protocols such as NCM, ECM and QMI when the surrounding Android/kernel environment makes them usable. This project adopts those ideas without copying its implementation: the app has a USB Host API probe, protocol/interface classification, driver capability matrix, persistent diagnostics, and a staged recovery log.
 
 The USB Host probe reports RNDIS, ECM, NCM, MBIM, CDC-data, modem/ACM candidates and vendor-specific WWAN candidates from descriptors. It does not claim to establish a userspace PPP/NCM/QMI link when the supplied R36S kernel lacks the corresponding kernel transport; those cases are explicitly shown as unsupported or candidate-only.
+
+## GitHub Actions Gradle wrapper permissions
+
+The workflow explicitly runs `chmod 755 ./gradlew` before invoking the wrapper and uses `bash ./gradlew ...` so a ZIP upload or repository checkout that loses the executable bit does not fail with exit code 126 (`Permission denied`).
