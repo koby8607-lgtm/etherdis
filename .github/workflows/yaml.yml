@@ -53,7 +53,6 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -78,11 +77,7 @@ jobs:
             -o busybox.tar.bz2
 
           tar -xjf busybox.tar.bz2
-
-          mv \
-            "busybox-${BUSYBOX_VERSION}" \
-            busybox-src
-
+          mv "busybox-${BUSYBOX_VERSION}" busybox-src
           rm -f busybox.tar.bz2
 
       - name: Patch BusyBox for ARM64 Android
@@ -128,6 +123,7 @@ jobs:
               "CONFIG_DESKTOP": "y",
               "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
               "CONFIG_LONG_OPTS": "y",
+
               "CONFIG_FEATURE_SUID": "y",
               "CONFIG_FEATURE_SUID_CONFIG": "y",
               "CONFIG_FEATURE_SUID_CONFIG_QUIET": "y",
@@ -204,6 +200,12 @@ jobs:
               "CONFIG_NETSTAT": "n",
               "CONFIG_TRACEROUTE": "n",
               "CONFIG_NC": "n",
+
+              "CONFIG_FEATURE_USE_BSS_TAIL": "n",
+              "CONFIG_FLOAT_DURATION": "n",
+              "CONFIG_FEATURE_RTMINMAX": "n",
+              "CONFIG_FEATURE_BUFFERS_GO_ON_STACK": "n",
+              "CONFIG_FEATURE_BUFFERS_USE_MALLOC": "n",
           }
 
           out = []
@@ -212,7 +214,6 @@ jobs:
           for line in lines:
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
-
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -220,7 +221,6 @@ jobs:
 
               if line.startswith("# CONFIG_") and line.endswith(" is not set"):
                   key = line[2:-11]
-
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -235,7 +235,30 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          make oldconfig </dev/null
+          # BusyBox's kconfig can still ask interactive questions for
+          # choice symbols. Feed empty/default answers without failing
+          # the workflow because the "yes" process receives SIGPIPE
+          # when make exits.
+          set +o pipefail
+          yes '' | make oldconfig
+          rc=$?
+          set -o pipefail
+
+          if [ "$rc" -ne 0 ]; then
+            echo "BusyBox oldconfig failed with exit code $rc"
+            exit "$rc"
+          fi
+
+          # Verify the important settings after kconfig normalization.
+          grep -q '^CONFIG_FEATURE_BUFFERS_GO_IN_BSS=y$' .config
+          grep -q '^# CONFIG_FEATURE_BUFFERS_GO_ON_STACK is not set$' .config \
+            || grep -q '^CONFIG_FEATURE_BUFFERS_GO_ON_STACK=n$' .config || true
+          grep -q '^# CONFIG_FEATURE_BUFFERS_USE_MALLOC is not set$' .config \
+            || grep -q '^CONFIG_FEATURE_BUFFERS_USE_MALLOC=n$' .config || true
+          grep -q '^CONFIG_STATIC=n$' .config \
+            || grep -q '^# CONFIG_STATIC is not set$' .config
+          grep -q '^CONFIG_SHA1_HWACCEL=n$' .config \
+            || grep -q '^# CONFIG_SHA1_HWACCEL is not set$' .config
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -247,7 +270,6 @@ jobs:
           TOOLCHAIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           export PATH="${TOOLCHAIN}:${PATH}"
-
           export CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
           export HOSTCC="cc"
           export AR="${TOOLCHAIN}/llvm-ar"
@@ -291,27 +313,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p \
-            app/src/main/assets/tools/arm64-v8a
+          mkdir -p app/src/main/assets/tools/arm64-v8a
 
-          cp \
-            busybox-src/busybox \
+          cp busybox-src/busybox \
             app/src/main/assets/tools/arm64-v8a/busybox
 
           chmod 755 \
             app/src/main/assets/tools/arm64-v8a/busybox
 
           if [ -f app/src/main/jni/arm64-v8a/usb0-native ]; then
-            cp \
-              app/src/main/jni/arm64-v8a/usb0-native \
+            cp app/src/main/jni/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
           elif [ -f app/src/main/cpp/arm64-v8a/usb0-native ]; then
-            cp \
-              app/src/main/cpp/arm64-v8a/usb0-native \
+            cp app/src/main/cpp/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
           else
-            cat > \
-              app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
+            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "$SELF/busybox" "$@"
@@ -321,8 +338,7 @@ jobs:
           chmod 755 \
             app/src/main/assets/tools/arm64-v8a/usb0-native
 
-          cat > \
-            app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
+          cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
           ARCH=arm64-v8a
           ANDROID_API=30
           BUSYBOX_VERSION=${BUSYBOX_VERSION}
@@ -382,7 +398,6 @@ jobs:
 
             unzip -l "$APK" \
               | grep -q "assets/tools/arm64-v8a/manifest.txt"
-
           done <<< "$APKS"
 
       - name: Upload APK
@@ -400,6 +415,7 @@ jobs:
           name: USB0-Manager-BusyBox-ARM64
           path: |
             busybox-src/busybox
+            busybox-src/.config
             app/src/main/assets/tools/arm64-v8a/manifest.txt
 
   validate-workflow:
@@ -421,7 +437,6 @@ jobs:
           import sys
 
           directory = Path(".github/workflows")
-
           workflows = sorted(directory.glob("*.yml"))
           workflows += sorted(directory.glob("*.yaml"))
 
@@ -436,11 +451,7 @@ jobs:
                   print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
                   sys.exit(1)
 
-              if "packages: 'tools" in text:
-                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
-                  sys.exit(1)
-
-              if 'packages: "tools' in text:
+              if "packages: 'tools" in text or 'packages: "tools' in text:
                   print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
                   sys.exit(1)
 
