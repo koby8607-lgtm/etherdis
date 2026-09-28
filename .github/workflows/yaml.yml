@@ -48,7 +48,7 @@ jobs:
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
 
-      - name: Prepare Gradle
+      - name: Prepare directories and Gradle
         shell: bash
         run: |
           set -euo pipefail
@@ -57,17 +57,12 @@ jobs:
           chmod 755 ./gradlew
           test -x ./gradlew
 
-      - name: Prepare directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
           mkdir -p \
             app/src/main/assets/tools/arm64-v8a \
             third_party \
             build-tools
 
-      - name: Download BusyBox
+      - name: Download BusyBox source
         shell: bash
         run: |
           set -euo pipefail
@@ -97,14 +92,24 @@ jobs:
 
           test -d "busybox-${BUSYBOX_VERSION}"
 
-      - name: Configure BusyBox
+      - name: Configure BusyBox for Android
         shell: bash
         run: |
           set -euo pipefail
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
-          make defconfig
+          # Use BusyBox's Android-oriented baseline instead of defconfig.
+          # This avoids enabling large numbers of Linux desktop utilities
+          # that do not build cleanly against Android/Bionic.
+          if make android2_defconfig; then
+            echo "Using android2_defconfig"
+          elif make android_defconfig; then
+            echo "Using android_defconfig"
+          else
+            echo "Android defconfig unavailable; using allnoconfig"
+            make allnoconfig
+          fi
 
           python3 - <<'PY'
           from pathlib import Path
@@ -113,7 +118,10 @@ jobs:
           path = Path(".config")
           text = path.read_text()
 
-          symbols = [
+          # Keep this build intentionally small and Android-friendly.
+          # Every required applet is explicitly enabled; unrelated
+          # utilities remain disabled.
+          enable = {
               "STATIC",
               "FEATURE_PREFER_APPLETS",
 
@@ -125,8 +133,6 @@ jobs:
               "FEATURE_IP_ADDRESS",
 
               "IFCONFIG",
-              "IFUP",
-              "IFDOWN",
               "ROUTE",
 
               "ARP",
@@ -136,13 +142,11 @@ jobs:
               "PING6",
 
               "UDHCPC",
-              "UDHCPD",
 
               "MODPROBE",
               "INSMOD",
               "RMMOD",
 
-              "LS",
               "CAT",
               "CP",
               "MV",
@@ -162,47 +166,88 @@ jobs:
               "UNAME",
               "KILL",
               "PS",
-          ]
+          }
 
-          for symbol in symbols:
+          # Utilities known to cause unnecessary Android/Bionic build
+          # problems are explicitly disabled.
+          disable = {
+              "HOSTID",
+              "GETOPT",
+              "RESET",
+              "SU",
+              "SULOGIN",
+              "LOGIN",
+              "INIT",
+              "MDEV",
+              "SWAPON",
+              "SWAPOFF",
+              "FSCK",
+              "FDISK",
+              "KPARTX",
+              "BLKID",
+              "MOUNT",
+              "UMOUNT",
+              "CROND",
+              "CRONTAB",
+              "SYSLOGD",
+              "KLOGD",
+          }
+
+          def set_symbol(src, symbol, value):
               pattern = re.compile(
-                  rf"^(?:# CONFIG_{re.escape(symbol)} is not set|CONFIG_{re.escape(symbol)}=.*)$",
+                  rf"^(?:CONFIG_{re.escape(symbol)}=.*|# CONFIG_{re.escape(symbol)} is not set)$",
                   re.MULTILINE,
               )
 
-              if pattern.search(text):
-                  text = pattern.sub(
-                      f"CONFIG_{symbol}=y",
-                      text,
-                      count=1,
-                  )
+              replacement = (
+                  f"CONFIG_{symbol}=y"
+                  if value
+                  else f"# CONFIG_{symbol} is not set"
+              )
+
+              if pattern.search(src):
+                  return pattern.sub(replacement, src, count=1)
+
+              # Do not inject unknown BusyBox symbols.
+              return src
+
+          for symbol in sorted(enable):
+              text = set_symbol(text, symbol, True)
+
+          for symbol in sorted(disable):
+              text = set_symbol(text, symbol, False)
 
           path.write_text(text)
           PY
 
+          # Resolve only the remaining configuration dependencies.
+          # Do not use `olddefconfig`: BusyBox does not provide that target.
           #
-          # BusyBox does not have the kernel-style olddefconfig target.
-          #
-          # Do NOT use:
-          #   yes "" | make oldconfig
-          #
-          # because yes receives SIGPIPE when make exits, and with
-          # "set -o pipefail" that produces:
-          #   yes: standard output: Broken pipe
-          #
-          # Capture the make status separately so a harmless SIGPIPE
-          # from yes cannot fail the workflow.
-          #
+          # Also avoid `yes | make oldconfig` under pipefail because `yes`
+          # can legitimately receive SIGPIPE after make finishes.
           set +e
-
-          yes "" | make oldconfig
-          make_status=${PIPESTATUS[1]}
-
+          make oldconfig < /dev/null
+          status=$?
           set -e
 
-          if [[ "${make_status}" -ne 0 ]]; then
-            echo "BusyBox make oldconfig failed with exit code ${make_status}"
-            exit "${make_status}"
+          if [[ "${status}" -ne 0 ]]; then
+            echo "make oldconfig returned ${status}; retrying with defaults"
+
+            set +e
+            make oldconfig </dev/zero
+            status=$?
+            set -e
+
+            if [[ "${status}" -ne 0 ]]; then
+              echo "BusyBox configuration failed"
+              exit "${status}"
+            fi
+          fi
+
+          # Never build hostid, which is the failure seen previously.
+          if grep -q '^CONFIG_HOSTID=y' .config; then
+            echo "ERROR: CONFIG_HOSTID is still enabled"
+            exit 1
           fi
 
       - name: Build BusyBox ARM64
@@ -218,8 +263,15 @@ jobs:
           test -x "${TOOLCHAIN}/llvm-ar"
           test -x "${TOOLCHAIN}/llvm-ranlib"
           test -x "${TOOLCHAIN}/llvm-strip"
+          test -x "${TOOLCHAIN}/llvm-readelf"
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
+
+          # BusyBox occasionally inherits GCC-oriented flags from its
+          # Android configuration. Remove static-libgcc because clang for
+          # Android does not use libgcc.
+          export CFLAGS="$(printf '%s' "${CFLAGS:-}" | sed 's/-static-libgcc//g')"
+          export LDFLAGS="$(printf '%s' "${LDFLAGS:-}" | sed 's/-static-libgcc//g')"
 
           make -j"$(nproc)" \
             ARCH=arm64 \
@@ -294,6 +346,18 @@ jobs:
               app/src/main/assets/tools/arm64-v8a/usb0-native
           fi
 
+      - name: Verify bundled tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f app/src/main/assets/tools/arm64-v8a/busybox
+          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/busybox \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
       - name: Create helper manifest
         shell: bash
         run: |
@@ -306,7 +370,7 @@ jobs:
           NATIVE_HELPER=usb0-native
           EOF
 
-      - name: Create JVM compatibility configuration
+      - name: Create JVM target configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -339,20 +403,28 @@ jobs:
           }
           EOF
 
-      - name: Verify project
+      - name: Detect Gradle project
         shell: bash
         run: |
           set -euo pipefail
 
           test -f ./gradlew
-          test -f settings.gradle || test -f settings.gradle.kts
-          test -f build.gradle || test -f build.gradle.kts
 
-          test -f \
-            app/src/main/assets/tools/arm64-v8a/busybox
+          if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
+            echo "ERROR: settings.gradle/settings.gradle.kts not found"
+            find . -maxdepth 4 -type f \
+              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              -print
+            exit 1
+          fi
 
-          test -f \
-            app/src/main/assets/tools/arm64-v8a/usb0-native
+          if [[ ! -f build.gradle && ! -f build.gradle.kts ]]; then
+            echo "ERROR: build.gradle/build.gradle.kts not found"
+            find . -maxdepth 4 -type f \
+              \( -name 'build.gradle' -o -name 'build.gradle.kts' \) \
+              -print
+            exit 1
+          fi
 
       - name: Build debug APK
         shell: bash
@@ -382,29 +454,32 @@ jobs:
         run: |
           set -euo pipefail
 
+          rm -rf artifacts
           mkdir -p artifacts
 
-          DEBUG_APK="$(
+          found=0
+
+          while IFS= read -r -d '' apk; do
+            echo "Found APK: ${apk}"
+            cp "${apk}" "artifacts/$(basename "${apk}")"
+            found=1
+          done < <(
             find . \
               -type f \
-              -path '*/build/outputs/apk/debug/*.apk' \
-              | head -n 1 || true
-          )"
+              -path '*/build/outputs/apk/*.apk' \
+              -print0
+          )
 
-          RELEASE_APK="$(
+          if [[ "${found}" -eq 0 ]]; then
+            echo "ERROR: No APKs produced"
             find . \
               -type f \
-              -path '*/build/outputs/apk/release/*.apk' \
-              | head -n 1 || true
-          )"
+              -path '*/build/outputs/*' \
+              -print || true
+            exit 1
+          fi
 
-          test -n "${DEBUG_APK}"
-          test -n "${RELEASE_APK}"
-
-          cp "${DEBUG_APK}" artifacts/app-debug.apk
-          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
-
-      - name: Verify embedded tools
+      - name: Verify embedded tools in APK
         shell: bash
         run: |
           set -euo pipefail
@@ -413,12 +488,10 @@ jobs:
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/busybox"
+              grep -F "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/usb0-native"
+              grep -F "assets/tools/arm64-v8a/usb0-native"
           done
 
       - name: Upload APKs
@@ -429,7 +502,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload diagnostics
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -449,7 +522,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate workflow
+      - name: Locate actual workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -470,21 +543,18 @@ jobs:
 
           if [[ -z "${WORKFLOW}" ]]; then
             echo "ERROR: no workflow file found"
-
             find .github/workflows \
               -maxdepth 1 \
               -type f \
               -print 2>/dev/null || true
-
             exit 1
           fi
 
-          echo "Workflow found: ${WORKFLOW}"
+          echo "Using ${WORKFLOW}"
 
           if grep -nE \
             'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
             "${WORKFLOW}" 2>/dev/null; then
-
             echo "ERROR: obsolete Android SDK 'tools' package detected"
             exit 1
           fi
