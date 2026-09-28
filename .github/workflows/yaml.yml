@@ -66,7 +66,7 @@ jobs:
             unzip \
             zip
 
-      - name: Prepare BusyBox source
+      - name: Download BusyBox
         shell: bash
         run: |
           set -euo pipefail
@@ -86,7 +86,7 @@ jobs:
 
           rm -f busybox.tar.bz2
 
-      - name: Patch BusyBox for ARM64 Android
+      - name: Apply ARM64 SHA1 compatibility patch
         shell: bash
         run: |
           set -euo pipefail
@@ -95,22 +95,58 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
+          import sys
 
-          p = Path("libbb/hash_md5_sha.c")
-          s = p.read_text()
+          path = Path("libbb/hash_md5_sha.c")
+          text = path.read_text()
 
-          old = "process_block = sha1_process_block64_shaNI;"
+          # BusyBox 1.37.0 has an x86-only SHA-NI symbol referenced from
+          # sha1_end(). The upstream fix is to guard that reference with
+          # i386/x86_64 checks. Patch the COMPLETE conditional block so that
+          # repeated/previous patch attempts cannot create unmatched #endifs.
+          pattern = re.compile(
+              r'(\tif \(ctx->process_block == sha1_process_block64\s*\n)'
+              r'(#if ENABLE_SHA1_HWACCEL\s*\n)'
+              r'(\s*\\\|\| ctx->process_block == sha1_process_block64_shaNI\s*\n)'
+              r'(#endif\s*\n)'
+              r'(\s*\) \{)',
+              re.MULTILINE
+          )
 
-          if old in s:
-              s = s.replace(
-                  old,
-                  "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
-                  "        process_block = sha1_process_block64_shaNI;\n"
-                  "#endif"
+          replacement = (
+              r'\1'
+              r'#if ENABLE_SHA1_HWACCEL' + "\n"
+              r'# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))' + "\n"
+              r'\3'
+              r'# endif' + "\n"
+              r'#endif' + "\n"
+              r'\5'
+          )
+
+          new_text, count = pattern.subn(replacement, text, count=1)
+
+          if count == 0:
+              # Already correctly patched: leave it alone.
+              required = (
+                  "#if ENABLE_SHA1_HWACCEL\n"
+                  "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
+                  "|| ctx->process_block == sha1_process_block64_shaNI\n"
+                  "# endif\n"
+                  "#endif\n"
               )
 
-          p.write_text(s)
+              if required not in text:
+                  print("ERROR: could not locate BusyBox SHA1 conditional block")
+                  sys.exit(1)
+
+              new_text = text
+
+          path.write_text(new_text)
           PY
+
+          # Verify the resulting preprocessor structure around sha1_end().
+          sed -n '/sha1_end(/,/hash_size = 5/p' libbb/hash_md5_sha.c
 
       - name: Configure BusyBox
         shell: bash
@@ -198,7 +234,6 @@ jobs:
               "CONFIG_DF": "y",
               "CONFIG_DMESG": "y",
 
-              "CONFIG_DEVFSD": "n",
               "CONFIG_STATIC": "n",
               "CONFIG_SHA1_HWACCEL": "n",
               "CONFIG_SHA256_HWACCEL": "n",
@@ -214,7 +249,6 @@ jobs:
               "CONFIG_FEATURE_BUFFERS_GO_ON_STACK": "n",
               "CONFIG_FEATURE_BUFFERS_USE_MALLOC": "n",
               "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
-
               "CONFIG_PIVOT_ROOT": "n",
           }
 
@@ -262,30 +296,18 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          # Resolve any remaining BusyBox Kconfig prompts.
-          #
-          # IMPORTANT:
-          # Do not use `yes | make oldconfig` while `set -e` is active.
-          # `yes` normally receives SIGPIPE once BusyBox exits and returns
-          # 141/1, which previously caused the GitHub step to fail even
-          # when make itself completed successfully.
-          set +e
+          # Non-interactive Kconfig normalization.
+          # Unlike `yes | make oldconfig`, this cannot fail because the
+          # `yes` process gets SIGPIPE after make exits.
+          make silentoldconfig
 
-          yes "" | make oldconfig 2>&1 | tee /tmp/busybox-oldconfig.log
-
-          PIPE_STATUS=("${PIPESTATUS[@]}")
-          MAKE_RC="${PIPE_STATUS[1]}"
-
-          set -e
-
-          cat /tmp/busybox-oldconfig.log
-
-          if [ "${MAKE_RC}" -ne 0 ]; then
-            echo "BusyBox oldconfig failed with exit code ${MAKE_RC}"
-            exit "${MAKE_RC}"
-          fi
-
-          echo "BusyBox oldconfig completed successfully."
+          # Ensure the critical options survived normalization.
+          grep -Eq '^# CONFIG_STATIC is not set$|^CONFIG_STATIC=n$' .config
+          grep -Eq '^# CONFIG_SHA1_HWACCEL is not set$|^CONFIG_SHA1_HWACCEL=n$' .config
+          grep -Eq '^CONFIG_FEATURE_BUFFERS_GO_IN_BSS=y$' .config
+          grep -Eq '^# CONFIG_FEATURE_BUFFERS_GO_ON_STACK is not set$|^CONFIG_FEATURE_BUFFERS_GO_ON_STACK=n$' .config
+          grep -Eq '^# CONFIG_FEATURE_BUFFERS_USE_MALLOC is not set$|^CONFIG_FEATURE_BUFFERS_USE_MALLOC=n$' .config
+          grep -Eq '^# CONFIG_PIVOT_ROOT is not set$|^CONFIG_PIVOT_ROOT=n$' .config
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -460,7 +482,6 @@ jobs:
           path: |
             busybox-src/busybox
             busybox-src/.config
-            /tmp/busybox-oldconfig.log
             app/src/main/assets/tools/arm64-v8a/manifest.txt
 
   validate-workflow:
