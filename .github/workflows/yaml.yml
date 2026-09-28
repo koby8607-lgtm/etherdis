@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -34,7 +34,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK
+      - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
@@ -49,7 +49,7 @@ jobs:
 
           echo "ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
 
-      - name: Install build packages
+      - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -74,17 +74,14 @@ jobs:
           chmod 755 ./gradlew
           bash ./gradlew --version
 
-      - name: Fix MonitorService Kotlin compile error
+      - name: Fix MonitorService Kotlin source
         shell: bash
         run: |
           set -euo pipefail
 
           FILE="app/src/main/java/com/r36s/usb0manager/MonitorService.kt"
 
-          if [ ! -f "${FILE}" ]; then
-            echo "ERROR: ${FILE} not found"
-            exit 1
-          fi
+          test -f "${FILE}"
 
           python3 - "${FILE}" <<'PY'
           from pathlib import Path
@@ -104,45 +101,42 @@ jobs:
           )
 
           if fixed in text:
-              print("MonitorService already fixed.")
+              pass
           elif target in text:
               text = text.replace(target, fixed, 1)
               path.write_text(text)
-              print("MonitorService return fixed.")
           else:
               marker = "private fun runHelper(command: String): String = try"
 
-              if marker in text:
-                  text = text.replace(
-                      marker,
-                      "private fun runHelper(command: String): String {\\n"
-                      "        return try",
-                      1
-                  )
-
-                  path.write_text(text)
-                  print("MonitorService expression body converted.")
-              else:
+              if marker not in text:
                   raise SystemExit(
-                      "ERROR: could not locate runHelper()"
+                      "ERROR: runHelper() was not found"
                   )
-          PY
 
-          if grep -Fq \
-            "return out + if (err.isNotBlank())" \
-            "${FILE}"; then
-            echo "ERROR: invalid bare return still exists"
-            exit 1
-          fi
+              text = text.replace(
+                  marker,
+                  "private fun runHelper(command: String): String {"
+                  "\n        return try",
+                  1
+              )
+
+              path.write_text(text)
+
+          if target in path.read_text():
+              raise SystemExit(
+                  "ERROR: bare return remains in runHelper()"
+              )
+
+          print("MonitorService Kotlin fix verified.")
+          PY
 
       - name: Prepare embedded tool directory
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p app/src/main/assets/tools/arm64-v8a
 
-      - name: Build ARM64 usb0-native when source exists
+      - name: Build usb0-native
         shell: bash
         run: |
           set -euo pipefail
@@ -183,19 +177,16 @@ jobs:
 
             "${TOOLCHAIN}/llvm-strip" \
               app/src/main/assets/tools/arm64-v8a/usb0-native || true
-
-            chmod 755 \
-              app/src/main/assets/tools/arm64-v8a/usb0-native
           else
             cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "$SELF/busybox" "$@"
           EOF
-
-            chmod 755 \
-              app/src/main/assets/tools/arm64-v8a/usb0-native
           fi
+
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
 
       - name: Create BusyBox build script
         shell: bash
@@ -227,8 +218,6 @@ jobs:
           mkdir -p "${WORK}"
           mkdir -p "${ASSET_DIR}"
 
-          echo "Downloading BusyBox ${VERSION}"
-
           curl -fsSL --retry 5 \
             "https://busybox.net/downloads/busybox-${VERSION}.tar.bz2" \
             -o "${WORK}/busybox.tar.bz2"
@@ -238,8 +227,6 @@ jobs:
           test -d "${SRC}"
 
           cd "${SRC}"
-
-          echo "Applying ARM64 SHA-NI guard"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -257,12 +244,10 @@ jobs:
                       continue
 
                   nearby = "\n".join(
-                      lines[max(0, i - 5):min(len(lines), i + 5)]
+                      lines[max(0, i - 5):min(len(lines), i + 6)]
                   )
 
-                  if "defined(__i386__)" in nearby:
-                      print("SHA-NI guard already present.")
-                  else:
+                  if "defined(__i386__)" not in nearby:
                       indent = line[:len(line) - len(line.lstrip())]
 
                       lines.insert(
@@ -278,14 +263,9 @@ jobs:
                       )
 
                       p.write_text("\n".join(lines) + "\n")
-                      print("SHA-NI ARM64 guard added.")
 
                   break
-          else:
-              print("No SHA-NI reference found.")
           PY
-
-          echo "Creating minimal Android-compatible BusyBox configuration"
 
           make allnoconfig
 
@@ -296,15 +276,12 @@ jobs:
           lines = path.read_text().splitlines()
 
           wanted = {
-              # Shell
               "CONFIG_ASH": "y",
               "CONFIG_ASH_OPTIMIZE_FOR_SIZE": "y",
               "CONFIG_FEATURE_SH_STANDALONE": "y",
 
-              # Basic utilities
               "CONFIG_CAT": "y",
               "CONFIG_CHMOD": "y",
-              "CONFIG_CHOWN": "y",
               "CONFIG_CP": "y",
               "CONFIG_CUT": "y",
               "CONFIG_ECHO": "y",
@@ -323,17 +300,14 @@ jobs:
               "CONFIG_SLEEP": "y",
               "CONFIG_SORT": "y",
               "CONFIG_STAT": "y",
-              "CONFIG_SYNC": "y",
               "CONFIG_TAIL": "y",
               "CONFIG_TEST": "y",
               "CONFIG_TOUCH": "y",
               "CONFIG_TR": "y",
               "CONFIG_UNAME": "y",
-              "CONFIG_UNSET": "y",
-              "CONFIG_USLEEP": "y",
               "CONFIG_WC": "y",
 
-              # Network tools
+              # Networking
               "CONFIG_IP": "y",
               "CONFIG_FEATURE_IP_ADDRESS": "y",
               "CONFIG_FEATURE_IP_LINK": "y",
@@ -349,7 +323,13 @@ jobs:
               "CONFIG_ARP": "y",
               "CONFIG_ARPING": "y",
               "CONFIG_PING": "y",
+
+              # FIX:
+              # PING6 depends on BusyBox IPv6 support. Enabling only
+              # CONFIG_PING6 causes Kconfig to force it back to 0.
+              "CONFIG_FEATURE_IPV6": "y",
               "CONFIG_PING6": "y",
+
               "CONFIG_UDHCPC": "y",
               "CONFIG_UDHCPC_DEFAULT_SCRIPT": "y",
 
@@ -372,8 +352,7 @@ jobs:
               "CONFIG_TRACEROUTE": "n",
               "CONFIG_NC": "n",
 
-              # Do NOT build mount/util-linux pieces.
-              # Android Bionic does not provide addmntent().
+              # Do not compile Android-incompatible mount code.
               "CONFIG_MOUNT": "n",
               "CONFIG_UMOUNT": "n",
               "CONFIG_PIVOT_ROOT": "n",
@@ -394,7 +373,7 @@ jobs:
               "CONFIG_AR": "n",
               "CONFIG_UNZIP": "n",
 
-              # Avoid remaining interactive/extra features
+              # Avoid unnecessary Kconfig features.
               "CONFIG_FEATURE_USE_BSS_TAIL": "n",
               "CONFIG_FLOAT_DURATION": "n",
               "CONFIG_FEATURE_RTMINMAX": "n",
@@ -440,33 +419,51 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          echo "Normalizing BusyBox configuration"
-
+          # Kconfig resolves dependencies here.
           set +e
+
           yes "" | make oldconfig > "${WORK}/oldconfig.log" 2>&1
+
           pipe_status=("${PIPESTATUS[@]}")
           make_rc="${pipe_status[1]}"
+
           set -e
 
           cat "${WORK}/oldconfig.log"
 
           if [ "${make_rc}" -ne 0 ]; then
-              echo "BusyBox oldconfig failed: ${make_rc}"
+              echo "BusyBox oldconfig failed with exit code ${make_rc}"
               exit "${make_rc}"
           fi
 
-          # Absolutely prevent the Android-incompatible mount code.
-          if grep -Eq \
-              '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=y$' \
+          # Verify IPv6 and PING6 survived dependency resolution.
+          if ! grep -Eq \
+              '^CONFIG_FEATURE_IPV6=y$' \
               .config; then
-              echo "ERROR: forbidden mount applet enabled"
+              echo "ERROR: CONFIG_FEATURE_IPV6 was disabled by Kconfig"
+              exit 1
+          fi
+
+          if ! grep -Eq \
+              '^CONFIG_PING6=y$' \
+              .config; then
+              echo "ERROR: CONFIG_PING6 was disabled by Kconfig"
               grep -E \
-                '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=' \
+                '^CONFIG_(FEATURE_IPV6|PING6)=' \
                 .config || true
               exit 1
           fi
 
-          echo "Compiling BusyBox for ARM64 Android"
+          # These must remain disabled because this is an Android Bionic
+          # userspace build, not a normal glibc/Linux userspace build.
+          if grep -Eq \
+              '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=y$' \
+              .config; then
+              echo "ERROR: incompatible util-linux mount applet enabled"
+              exit 1
+          fi
+
+          echo "Building BusyBox ARM64."
 
           export CC="${CC}"
           export HOSTCC="cc"
@@ -492,39 +489,40 @@ jobs:
           test -f busybox
 
           # IMPORTANT:
-          # busybox is AArch64 and the GitHub runner is x86_64.
-          # NEVER execute the target binary on the runner.
-          # The previous workflow used:
-          #     busybox --list
-          # which caused Exec format error.
-          #
-          # Verify the applets through the generated Kconfig header instead.
+          # The GitHub Actions runner is x86_64.
+          # BusyBox is AArch64 and MUST NOT be executed here.
+          # Therefore we verify the compiled applets through autoconf.h.
           test -f include/autoconf.h
 
-          for symbol in \
-              IP \
-              IFCONFIG \
-              ARP \
-              ARPING \
-              ROUTE \
-              UDHCPC \
-              PING \
-              PING6 \
-              MODPROBE \
-              INSMOD \
-              RMMOD; do
+          required_symbols=(
+              IP
+              IFCONFIG
+              ARP
+              ARPING
+              ROUTE
+              UDHCPC
+              PING
+              PING6
+              MODPROBE
+              INSMOD
+              RMMOD
+          )
 
-              grep -Eq \
-                "^#define ENABLE_${symbol} 1$" \
-                include/autoconf.h || {
+          for symbol in "${required_symbols[@]}"; do
+              if ! grep -Eq \
+                  "^#define ENABLE_${symbol} 1$" \
+                  include/autoconf.h; then
 
-                echo "ERROR: BusyBox applet ${symbol} was not compiled"
-                grep -E "ENABLE_${symbol}" include/autoconf.h || true
-                exit 1
-              }
+                  echo "ERROR: BusyBox applet ${symbol} was not compiled"
+                  grep -E \
+                    "ENABLE_${symbol}" \
+                    include/autoconf.h || true
+
+                  exit 1
+              fi
           done
 
-          echo "All required BusyBox applets are compiled."
+          echo "All required BusyBox applets compiled."
 
           mkdir -p "${ASSET_DIR}"
 
@@ -533,27 +531,21 @@ jobs:
 
           "${STRIP}" "${OUT}" || true
 
-          echo "Verifying ARM64 ELF"
-
           file "${OUT}"
 
           "${TOOLCHAIN}/llvm-readelf" -h "${OUT}" \
-            | grep -Eq \
-              "Class:.*ELF64"
+            | grep -Eq "Class:.*ELF64"
 
           "${TOOLCHAIN}/llvm-readelf" -h "${OUT}" \
-            | grep -Eq \
-              "Machine:.*AArch64"
+            | grep -Eq "Machine:.*AArch64"
 
           "${TOOLCHAIN}/llvm-readelf" -l "${OUT}" \
-            | grep -q \
-              "Requesting program interpreter"
+            | grep -q "Requesting program interpreter"
 
-          echo "BusyBox ARM64 build verified successfully."
+          echo "BusyBox ARM64 verified."
           SCRIPT
 
           chmod 755 scripts/build-busybox.sh
-
           bash -n scripts/build-busybox.sh
 
       - name: Build BusyBox
@@ -566,53 +558,43 @@ jobs:
 
           bash ./scripts/build-busybox.sh
 
-      - name: Install fallback helper files
+      - name: Install embedded helper scripts
         shell: bash
         run: |
           set -euo pipefail
 
-          ASSET_DIR="app/src/main/assets/tools/arm64-v8a"
+          DIR="app/src/main/assets/tools/arm64-v8a"
 
-          mkdir -p "${ASSET_DIR}"
-
-          if [ ! -f "${ASSET_DIR}/usb0-helper.sh" ]; then
-            cat > "${ASSET_DIR}/usb0-helper.sh" <<'EOF'
+          cat > "${DIR}/usb0-helper.sh" <<'EOF'
           #!/system/bin/sh
-
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-          BUSYBOX="${SELF}/busybox"
-
-          exec "${BUSYBOX}" "$@"
+          exec "${SELF}/busybox" "$@"
           EOF
 
-            chmod 755 "${ASSET_DIR}/usb0-helper.sh"
-          fi
-
-          if [ ! -f "${ASSET_DIR}/usb0-helper" ]; then
-            cat > "${ASSET_DIR}/usb0-helper" <<'EOF'
+          cat > "${DIR}/usb0-helper" <<'EOF'
           #!/system/bin/sh
-
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-          BUSYBOX="${SELF}/busybox"
-
-          exec "${BUSYBOX}" "$@"
+          exec "${SELF}/busybox" "$@"
           EOF
 
-            chmod 755 "${ASSET_DIR}/usb0-helper"
-          fi
+          chmod 755 \
+            "${DIR}/usb0-helper.sh" \
+            "${DIR}/usb0-helper"
 
-          cat > "${ASSET_DIR}/manifest.txt" <<EOF
+          cat > "${DIR}/manifest.txt" <<EOF
           ARCH=arm64-v8a
           ANDROID_API=${ANDROID_API_LEVEL}
           BUSYBOX_VERSION=${BUSYBOX_VERSION}
           STATIC=NO
+          IPV6=YES
+          PING6=YES
           SHA1_HWACCEL=NO
           SHA256_HWACCEL=NO
           TC=NO
           MOUNT=NO
           UMOUNT=NO
           PIVOT_ROOT=NO
-          TARGET_BINARY_MUST_NOT_RUN_ON_CI=true
+          TARGET_BINARY_MUST_NOT_RUN_ON_CI=YES
           EOF
 
       - name: Verify embedded files
@@ -620,18 +602,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          ASSET_DIR="app/src/main/assets/tools/arm64-v8a"
+          DIR="app/src/main/assets/tools/arm64-v8a"
 
-          test -s "${ASSET_DIR}/busybox"
-          test -s "${ASSET_DIR}/usb0-native"
-          test -s "${ASSET_DIR}/usb0-helper"
-          test -s "${ASSET_DIR}/usb0-helper.sh"
-          test -s "${ASSET_DIR}/manifest.txt"
+          test -s "${DIR}/busybox"
+          test -s "${DIR}/usb0-native"
+          test -s "${DIR}/usb0-helper"
+          test -s "${DIR}/usb0-helper.sh"
+          test -s "${DIR}/manifest.txt"
 
-          file "${ASSET_DIR}/busybox"
-          file "${ASSET_DIR}/usb0-native"
+          file "${DIR}/busybox"
+          file "${DIR}/usb0-native"
 
-      - name: Configure Gradle
+      - name: Configure Gradle JVM
         shell: bash
         run: |
           set -euo pipefail
@@ -679,8 +661,6 @@ jobs:
           if "android-build-fix.gradle" not in text:
               text += '\napply from: "android-build-fix.gradle"\n'
               build_file.write_text(text)
-
-          print(f"Gradle JVM compatibility applied to {build_file}")
           PY
 
       - name: Build debug APK
@@ -721,34 +701,28 @@ jobs:
           )
 
           if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "ERROR: no APKs were produced"
-            exit 1
+              echo "ERROR: no APK produced"
+              exit 1
           fi
 
           for apk in "${APKS[@]}"; do
-            echo "Checking ${apk}"
+              echo "Checking ${apk}"
 
-            unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/busybox"
+              unzip -l "${apk}" \
+                | grep -q \
+                  "assets/tools/arm64-v8a/busybox"
 
-            unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/usb0-native"
+              unzip -l "${apk}" \
+                | grep -q \
+                  "assets/tools/arm64-v8a/usb0-native"
 
-            unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/usb0-helper"
+              unzip -l "${apk}" \
+                | grep -q \
+                  "assets/tools/arm64-v8a/usb0-helper.sh"
 
-            unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/usb0-helper.sh"
-
-            unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/manifest.txt"
-
-            echo "Verified ${apk}"
+              unzip -l "${apk}" \
+                | grep -q \
+                  "assets/tools/arm64-v8a/manifest.txt"
           done
 
       - name: Upload APK
@@ -771,7 +745,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload diagnostics if build fails
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -792,14 +766,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate YAML and forbidden settings
+      - name: Validate workflow
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import sys
 
           directory = Path(".github/workflows")
 
@@ -809,24 +782,25 @@ jobs:
           if not files:
               raise SystemExit("No workflow files found")
 
+          forbidden = (
+              "sdkmanager tools",
+              "packages: 'tools",
+              'packages: "tools',
+              "android-actions/setup-android@v2",
+              "busybox --list",
+              "busybox\" --list",
+              "CONFIG_MOUNT=y",
+              "CONFIG_UMOUNT=y",
+              "CONFIG_PIVOT_ROOT=y",
+          )
+
           for workflow in files:
               text = workflow.read_text()
 
-              forbidden = [
-                  "sdkmanager tools",
-                  "packages: 'tools",
-                  'packages: "tools',
-                  "android-actions/setup-android@v2",
-                  "CONFIG_MOUNT=y",
-                  "CONFIG_UMOUNT=y",
-                  "CONFIG_PIVOT_ROOT=y",
-                  "busybox --list",
-              ]
-
-              for item in forbidden:
-                  if item in text:
+              for pattern in forbidden:
+                  if pattern in text:
                       raise SystemExit(
-                          f"Forbidden pattern {item!r} found in {workflow}"
+                          f"Forbidden pattern {pattern!r} found in {workflow}"
                       )
 
               print(f"Validated {workflow}")
