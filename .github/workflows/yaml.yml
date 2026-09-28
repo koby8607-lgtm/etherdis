@@ -97,26 +97,25 @@ jobs:
           if good not in s and bad in s:
               s = s.replace(bad, good, 1)
 
-          if good not in s:
-              marker = "private fun runHelper(command: String): String = try"
+          marker = "private fun runHelper(command: String): String = try"
 
-              if marker in s:
-                  s = s.replace(
-                      marker,
-                      "private fun runHelper(command: String): String {\n"
-                      "        return try",
-                      1
-                  )
+          if marker in s:
+              s = s.replace(
+                  marker,
+                  "private fun runHelper(command: String): String {\n"
+                  "        return try",
+                  1
+              )
 
           p.write_text(s)
 
           final = p.read_text()
 
           if bad in final:
-              raise SystemExit("Bare return still exists in runHelper()")
+              raise SystemExit("ERROR: invalid bare return remains")
 
           if marker in final:
-              raise SystemExit("Expression-body runHelper() still exists")
+              raise SystemExit("ERROR: expression-body runHelper remains")
 
           print("MonitorService Kotlin fix verified.")
           PY
@@ -201,12 +200,12 @@ jobs:
           from pathlib import Path
 
           p = Path("libbb/hash_md5_sha.c")
-          s = p.read_text()
+          text = p.read_text()
 
           needle = "sha1_process_block64_shaNI"
 
-          if needle in s:
-              lines = s.splitlines()
+          if needle in text:
+              lines = text.splitlines()
 
               for i, line in enumerate(lines):
                   if needle not in line:
@@ -338,10 +337,10 @@ jobs:
               "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
           }
 
-          def emit(k, v):
-              if v == "n":
-                  return f"# {k} is not set"
-              return f"{k}={v}"
+          def emit(key, value):
+              if value == "n":
+                  return f"# {key} is not set"
+              return f"{key}={value}"
 
           output = []
           seen = set()
@@ -368,9 +367,11 @@ jobs:
           PY
 
           set +e
+
           yes "" | make oldconfig > "${work}/oldconfig.log" 2>&1
           statuses=("${PIPESTATUS[@]}")
           make_rc="${statuses[1]}"
+
           set -e
 
           cat "${work}/oldconfig.log"
@@ -390,7 +391,7 @@ jobs:
               CONFIG_PIVOT_ROOT; do
 
             if grep -Eq "^${symbol}=y$" .config; then
-              echo "Forbidden ${symbol}=y"
+              echo "ERROR: forbidden ${symbol}=y"
               exit 1
             fi
           done
@@ -402,7 +403,7 @@ jobs:
               CONFIG_PING; do
 
             if ! grep -Eq "^${symbol}=y$" .config; then
-              echo "Missing required ${symbol}=y"
+              echo "ERROR: required ${symbol}=y missing"
               exit 1
             fi
           done
@@ -413,8 +414,6 @@ jobs:
           export RANLIB="$(command -v ranlib)"
           export STRIP="${toolchain}/llvm-strip"
 
-          # Do not define __ANDROID_API__ manually.
-          # The Android target compiler already supplies it.
           export CFLAGS="-Os -fPIE"
           export LDFLAGS="-pie"
 
@@ -430,17 +429,16 @@ jobs:
           test -f busybox
           test -f include/autoconf.h
 
-          # Never execute the AArch64 target binary on the x86_64 GitHub runner.
           for symbol in IP ARP UDHCPC PING; do
             grep -Eq "^#define ENABLE_${symbol} 1$" include/autoconf.h || {
-              echo "Missing BusyBox applet ${symbol}"
+              echo "ERROR: missing BusyBox applet ${symbol}"
               exit 1
             }
           done
 
           for symbol in IFCONFIG ROUTE ARPING PING6; do
             if grep -Eq "^#define ENABLE_${symbol} 1$" include/autoconf.h; then
-              echo "Forbidden BusyBox applet ${symbol} was compiled"
+              echo "ERROR: forbidden BusyBox applet ${symbol} was compiled"
               exit 1
             fi
           done
@@ -563,20 +561,16 @@ jobs:
             echo "Checking ${apk}"
 
             unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/busybox"
+              | grep -q "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/usb0-native"
+              | grep -q "assets/tools/arm64-v8a/usb0-native"
 
             unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/usb0-helper.sh"
+              | grep -q "assets/tools/arm64-v8a/usb0-helper.sh"
 
             unzip -l "${apk}" \
-              | grep -q \
-                "assets/tools/arm64-v8a/manifest.txt"
+              | grep -q "assets/tools/arm64-v8a/manifest.txt"
 
             echo "Verified ${apk}"
           done
@@ -601,41 +595,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  verify:
-    runs-on: ubuntu-24.04
-    needs: build
-
-    steps:
-      - name: Download APK artifact
-        uses: actions/download-artifact@v4
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          name: USB0-Manager-APK
-          path: verified-apks
-
-      - name: Verify build job output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mapfile -t apks < <(
-            find verified-apks \
-              -type f \
-              -name "*.apk" \
-              | sort
-          )
-
-          if [ "${#apks[@]}" -eq 0 ]; then
-            echo "ERROR: no APK received from build job"
-            exit 1
-          fi
-
-          for apk in "${apks[@]}"; do
-            echo "Received: ${apk}"
-            file "${apk}"
-          done
+          name: USB0-Manager-build-diagnostics
+          path: |
+            app/build/reports/**
+            app/build/outputs/**
+            /tmp/**
+          if-no-files-found: ignore
+          retention-days: 7
 
   validate:
     runs-on: ubuntu-24.04
+    needs: build
+    if: always()
 
     steps:
       - name: Checkout
@@ -649,34 +624,39 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          files = sorted(Path(".github/workflows").glob("*.yml"))
-          files += sorted(Path(".github/workflows").glob("*.yaml"))
+          directory = Path(".github/workflows")
+
+          files = sorted(directory.glob("*.yml"))
+          files += sorted(directory.glob("*.yaml"))
 
           if not files:
               raise SystemExit("No workflow files found")
 
-          forbidden = (
-              "sdkmanager tools",
-              "packages: 'tools",
-              'packages: "tools',
+          # Build forbidden strings at runtime instead of putting the
+          # exact strings into this validator. This prevents the validator
+          # from detecting its own test strings.
+          forbidden = [
+              "sdkmanager" + " tools",
+              "packages: " + "'tools",
+              "packages: " + '"tools',
               "android-actions/setup-android@v2",
               "android-build-fix.gradle",
               "busybox --list",
               "CONFIG_MOUNT=y",
               "CONFIG_UMOUNT=y",
               "CONFIG_PIVOT_ROOT=y",
-          )
+          ]
 
-          for path in files:
-              text = path.read_text()
+          for workflow in files:
+              text = workflow.read_text()
 
               for pattern in forbidden:
                   if pattern in text:
                       raise SystemExit(
-                          f"Forbidden pattern {pattern!r} found in {path}"
+                          f"Forbidden configuration detected in {workflow}"
                       )
 
-              print(f"Validated {path}")
+              print(f"Validated {workflow}")
 
           print("All workflow files passed validation.")
           PY
