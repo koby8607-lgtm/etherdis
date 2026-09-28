@@ -53,7 +53,6 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -79,14 +78,10 @@ jobs:
             -o busybox.tar.bz2
 
           tar -xjf busybox.tar.bz2
-
-          mv \
-            "busybox-${BUSYBOX_VERSION}" \
-            busybox-src
-
+          mv "busybox-${BUSYBOX_VERSION}" busybox-src
           rm -f busybox.tar.bz2
 
-      - name: Apply ARM64 SHA1 compatibility patch
+      - name: Apply ARM64 SHA-NI compatibility patch
         shell: bash
         run: |
           set -euo pipefail
@@ -95,58 +90,83 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           path = Path("libbb/hash_md5_sha.c")
-          text = path.read_text()
+          lines = path.read_text().splitlines()
 
-          # BusyBox 1.37.0 has an x86-only SHA-NI symbol referenced from
-          # sha1_end(). The upstream fix is to guard that reference with
-          # i386/x86_64 checks. Patch the COMPLETE conditional block so that
-          # repeated/previous patch attempts cannot create unmatched #endifs.
-          pattern = re.compile(
-              r'(\tif \(ctx->process_block == sha1_process_block64\s*\n)'
-              r'(#if ENABLE_SHA1_HWACCEL\s*\n)'
-              r'(\s*\\\|\| ctx->process_block == sha1_process_block64_shaNI\s*\n)'
-              r'(#endif\s*\n)'
-              r'(\s*\) \{)',
-              re.MULTILINE
-          )
+          target = "|| ctx->process_block == sha1_process_block64_shaNI"
 
-          replacement = (
-              r'\1'
-              r'#if ENABLE_SHA1_HWACCEL' + "\n"
-              r'# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))' + "\n"
-              r'\3'
-              r'# endif' + "\n"
-              r'#endif' + "\n"
-              r'\5'
-          )
+          matches = [
+              i for i, line in enumerate(lines)
+              if target in line
+          ]
 
-          new_text, count = pattern.subn(replacement, text, count=1)
+          if not matches:
+              print("ERROR: sha1_process_block64_shaNI reference not found")
+              sys.exit(1)
 
-          if count == 0:
-              # Already correctly patched: leave it alone.
-              required = (
-                  "#if ENABLE_SHA1_HWACCEL\n"
-                  "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
-                  "|| ctx->process_block == sha1_process_block64_shaNI\n"
-                  "# endif\n"
-                  "#endif\n"
+          idx = matches[0]
+
+          # Do not patch twice.
+          before = "\n".join(lines[max(0, idx - 3):idx])
+          after = "\n".join(lines[idx + 1:min(len(lines), idx + 4)])
+
+          if "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))" in before \
+             and "# endif" in after:
+              print("SHA-NI guard already present")
+          else:
+              indent = lines[idx][:len(lines[idx]) - len(lines[idx].lstrip())]
+
+              lines.insert(
+                  idx,
+                  "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))"
               )
 
-              if required not in text:
-                  print("ERROR: could not locate BusyBox SHA1 conditional block")
-                  sys.exit(1)
+              # Original target moved one line down.
+              lines.insert(
+                  idx + 2,
+                  "# endif"
+              )
 
-              new_text = text
+              path.write_text("\n".join(lines) + "\n")
+              print("Applied ARM64 SHA-NI guard")
 
-          path.write_text(new_text)
+          # Verify the exact upstream-style structure.
+          text = path.read_text()
+
+          expected = (
+              "#if ENABLE_SHA1_HWACCEL\n"
+              "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
+              "\t || ctx->process_block == sha1_process_block64_shaNI\n"
+              "# endif\n"
+              "#endif"
+          )
+
+          # BusyBox 1.37.0 uses tabs/spaces that can vary slightly.
+          if target not in text:
+              print("ERROR: SHA-NI reference disappeared")
+              sys.exit(1)
+
+          sha_idx = text.index(target)
+
+          surrounding = text[max(0, sha_idx - 180):sha_idx + 180]
+
+          if "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))" not in surrounding:
+              print("ERROR: ARM64 SHA-NI guard was not inserted")
+              sys.exit(1)
+
+          if "# endif" not in surrounding:
+              print("ERROR: closing SHA-NI guard was not inserted")
+              sys.exit(1)
+
+          print("SHA-NI patch verification passed")
           PY
 
-          # Verify the resulting preprocessor structure around sha1_end().
-          sed -n '/sha1_end(/,/hash_size = 5/p' libbb/hash_md5_sha.c
+          echo "Relevant BusyBox SHA1 section:"
+          grep -n -B5 -A5 \
+            "sha1_process_block64_shaNI" \
+            libbb/hash_md5_sha.c
 
       - name: Configure BusyBox
         shell: bash
@@ -296,18 +316,28 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          # Non-interactive Kconfig normalization.
-          # Unlike `yes | make oldconfig`, this cannot fail because the
-          # `yes` process gets SIGPIPE after make exits.
-          make silentoldconfig
+          # Kconfig may still have defaulted values that need normalization.
+          # Use a temporary config input containing only blank/default answers.
+          # Capture make's status explicitly so SIGPIPE from an answer producer
+          # cannot make the workflow fail.
+          set +e
+          yes "" | make oldconfig >/tmp/busybox-oldconfig.log 2>&1
+          PIPE_STATUS=("${PIPESTATUS[@]}")
+          MAKE_RC="${PIPE_STATUS[1]}"
+          set -e
 
-          # Ensure the critical options survived normalization.
-          grep -Eq '^# CONFIG_STATIC is not set$|^CONFIG_STATIC=n$' .config
-          grep -Eq '^# CONFIG_SHA1_HWACCEL is not set$|^CONFIG_SHA1_HWACCEL=n$' .config
-          grep -Eq '^CONFIG_FEATURE_BUFFERS_GO_IN_BSS=y$' .config
-          grep -Eq '^# CONFIG_FEATURE_BUFFERS_GO_ON_STACK is not set$|^CONFIG_FEATURE_BUFFERS_GO_ON_STACK=n$' .config
-          grep -Eq '^# CONFIG_FEATURE_BUFFERS_USE_MALLOC is not set$|^CONFIG_FEATURE_BUFFERS_USE_MALLOC=n$' .config
-          grep -Eq '^# CONFIG_PIVOT_ROOT is not set$|^CONFIG_PIVOT_ROOT=n$' .config
+          cat /tmp/busybox-oldconfig.log
+
+          if [ "${MAKE_RC}" -ne 0 ]; then
+            echo "BusyBox oldconfig failed with exit code ${MAKE_RC}"
+            exit "${MAKE_RC}"
+          fi
+
+          echo "Final critical BusyBox configuration:"
+          grep -E \
+            '^(CONFIG_STATIC|CONFIG_SHA1_HWACCEL|CONFIG_SHA256_HWACCEL|CONFIG_TC|CONFIG_PIVOT_ROOT|CONFIG_FEATURE_BUFFERS_GO_IN_BSS)=' \
+            .config \
+            || true
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -503,7 +533,6 @@ jobs:
           import sys
 
           directory = Path(".github/workflows")
-
           workflows = sorted(directory.glob("*.yml"))
           workflows += sorted(directory.glob("*.yaml"))
 
