@@ -1,3 +1,0 @@
-#!/system/bin/sh
-BASE=$(dirname "$0")
-exec sh "$BASE/usb0-helper.sh" "$@"
