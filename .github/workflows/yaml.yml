@@ -5,34 +5,42 @@ on:
   push:
     branches:
       - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
 
 permissions:
-  contents: read
+  contents: write
 
 env:
+  ANDROID_API_LEVEL: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "27.2.12479018"
   BUSYBOX_VERSION: "1.37.0"
-  NDK_VERSION: "27.2.12479018"
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: "platform-tools"
 
-      - name: Install Android SDK components
+      - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
@@ -40,11 +48,12 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
           sdkmanager \
-            "platforms;android-30" \
-            "build-tools;35.0.0" \
-            "ndk;${NDK_VERSION}"
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
 
-          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Install build dependencies
         shell: bash
@@ -55,100 +64,163 @@ jobs:
 
           sudo apt-get install -y \
             build-essential \
+            binutils \
             clang \
             curl \
             file \
-            git \
             make \
-            binutils \
             python3 \
             unzip \
             zip
 
-      - name: Download BusyBox
+      - name: Prepare Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf busybox-src
-          rm -f busybox.tar.bz2
+          chmod 755 ./gradlew
 
-          curl -L --fail --retry 5 \
-            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" \
-            -o busybox.tar.bz2
+          bash ./gradlew --version
 
-          tar -xjf busybox.tar.bz2
-
-          mv \
-            "busybox-${BUSYBOX_VERSION}" \
-            busybox-src
-
-          rm -f busybox.tar.bz2
-
-      - name: Patch BusyBox SHA1 for ARM64
+      - name: Fix MonitorService Kotlin compile error
         shell: bash
         run: |
           set -euo pipefail
 
-          cd busybox-src
+          FILE="app/src/main/java/com/r36s/usb0manager/MonitorService.kt"
+
+          test -f "${FILE}"
+
+          python3 - "${FILE}" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          old = (
+              'if (p.exitValue() == 0 || out.isNotBlank()) '
+              'return out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""'
+          )
+
+          new = (
+              'if (p.exitValue() == 0 || out.isNotBlank()) '
+              'return@runHelper out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""'
+          )
+
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          if 'return@runHelper out +' not in text:
+              raise SystemExit(
+                  "ERROR: runHelper return statement was not fixed"
+              )
+
+          path.write_text(text)
+          PY
+
+          grep -Fq "return@runHelper out +" "${FILE}"
+
+      - name: Build ARM64 usb0-native
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK="${ANDROID_NDK_ROOT}"
+          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          mkdir -p app/src/main/assets/tools/arm64-v8a
+
+          "${TOOLCHAIN}/aarch64-linux-android30-clang" \
+            -O2 \
+            -fPIE \
+            -fstack-protector-strong \
+            -DANDROID \
+            -D__ANDROID_API__=30 \
+            -pie \
+            app/src/main/cpp/usb0-native.c \
+            -o app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          "${TOOLCHAIN}/llvm-strip" \
+            app/src/main/assets/tools/arm64-v8a/usb0-native || true
+
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          file \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+      - name: Replace BusyBox build script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > scripts/build-busybox.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          VERSION="${BUSYBOX_VERSION:-1.37.0}"
+          WORK="${RUNNER_TEMP:-/tmp}/usb0-busybox"
+          SRC="${WORK}/busybox-${VERSION}"
+          OUT="app/src/main/assets/tools/arm64-v8a/busybox"
+
+          NDK="${ANDROID_NDK_ROOT:-${ANDROID_HOME}/ndk/27.2.12479018}"
+          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
+          STRIP="${TOOLCHAIN}/llvm-strip"
+          AR="$(command -v ar)"
+          RANLIB="$(command -v ranlib)"
+
+          rm -rf "${WORK}"
+          mkdir -p "${WORK}"
+
+          curl -fsSL --retry 5 \
+            "https://busybox.net/downloads/busybox-${VERSION}.tar.bz2" \
+            -o "${WORK}/busybox.tar.bz2"
+
+          tar -xjf "${WORK}/busybox.tar.bz2" -C "${WORK}"
+
+          cd "${SRC}"
 
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("libbb/hash_md5_sha.c")
-          text = path.read_text()
+          p = Path("libbb/hash_md5_sha.c")
+          text = p.read_text()
 
           target = "sha1_process_block64_shaNI"
 
-          if target not in text:
-              print("No SHA-NI reference found; nothing to patch.")
-              raise SystemExit(0)
+          if target in text:
+              lines = text.splitlines()
 
-          lines = text.splitlines()
+              for i, line in enumerate(lines):
+                  if target not in line:
+                      continue
 
-          for i, line in enumerate(lines):
-              if target not in line:
-                  continue
+                  nearby = "\n".join(
+                      lines[max(0, i - 5):min(len(lines), i + 6)]
+                  )
 
-              already_guarded = False
+                  if "defined(__i386__)" not in nearby:
+                      indent = line[:len(line) - len(line.lstrip())]
 
-              for j in range(max(0, i - 4), i):
-                  if (
-                      "defined(__i386__)" in lines[j]
-                      and "defined(__x86_64__)" in lines[j]
-                  ):
-                      already_guarded = True
-                      break
+                      lines.insert(
+                          i,
+                          indent
+                          + "#if defined(__GNUC__) && "
+                          "(defined(__i386__) || defined(__x86_64__))"
+                      )
 
-              if already_guarded:
-                  print("SHA-NI guard already present.")
-                  raise SystemExit(0)
+                      lines.insert(
+                          i + 2,
+                          indent + "#endif"
+                      )
 
-              indent = line[:len(line) - len(line.lstrip())]
+                      p.write_text("\n".join(lines) + "\n")
 
-              lines.insert(
-                  i,
-                  f"{indent}#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))"
-              )
-
-              lines.insert(
-                  i + 2,
-                  f"{indent}#endif"
-              )
-
-              path.write_text("\n".join(lines) + "\n")
-              print("SHA-NI ARM64 guard applied.")
-              raise SystemExit(0)
-
-          raise SystemExit("ERROR: SHA-NI reference could not be patched")
+                  break
           PY
-
-      - name: Configure BusyBox
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd busybox-src
 
           make allnoconfig
 
@@ -159,17 +231,12 @@ jobs:
           lines = path.read_text().splitlines()
 
           wanted = {
-              # Shell
-              "CONFIG_DESKTOP": "y",
-              "CONFIG_LONG_OPTS": "y",
               "CONFIG_ASH": "y",
               "CONFIG_ASH_OPTIMIZE_FOR_SIZE": "y",
               "CONFIG_FEATURE_SH_STANDALONE": "y",
 
-              # Basic tools
               "CONFIG_CAT": "y",
               "CONFIG_CHMOD": "y",
-              "CONFIG_CHOWN": "y",
               "CONFIG_CP": "y",
               "CONFIG_CUT": "y",
               "CONFIG_ECHO": "y",
@@ -188,17 +255,13 @@ jobs:
               "CONFIG_SLEEP": "y",
               "CONFIG_SORT": "y",
               "CONFIG_STAT": "y",
-              "CONFIG_SYNC": "y",
               "CONFIG_TAIL": "y",
               "CONFIG_TEST": "y",
               "CONFIG_TOUCH": "y",
               "CONFIG_TR": "y",
               "CONFIG_UNAME": "y",
-              "CONFIG_UNSET": "y",
-              "CONFIG_USLEEP": "y",
               "CONFIG_WC": "y",
 
-              # Networking
               "CONFIG_IP": "y",
               "CONFIG_FEATURE_IP_ADDRESS": "y",
               "CONFIG_FEATURE_IP_LINK": "y",
@@ -218,31 +281,25 @@ jobs:
               "CONFIG_UDHCPC": "y",
               "CONFIG_UDHCPC_DEFAULT_SCRIPT": "y",
 
-              # Modules
               "CONFIG_MODPROBE": "y",
               "CONFIG_INSMOD": "y",
               "CONFIG_RMMOD": "y",
-
-              # Diagnostics
               "CONFIG_DMESG": "y",
-              "CONFIG_DF": "y",
 
-              # Android ARM64 compatibility
               "CONFIG_STATIC": "n",
               "CONFIG_SHA1_HWACCEL": "n",
               "CONFIG_SHA256_HWACCEL": "n",
               "CONFIG_TC": "n",
+
               "CONFIG_HOSTID": "n",
               "CONFIG_NETSTAT": "n",
               "CONFIG_TRACEROUTE": "n",
               "CONFIG_NC": "n",
 
-              # Do not compile Android-incompatible mount code.
               "CONFIG_MOUNT": "n",
               "CONFIG_UMOUNT": "n",
               "CONFIG_PIVOT_ROOT": "n",
               "CONFIG_SWAPONOFF": "n",
-              "CONFIG_FREERAMDISK": "n",
               "CONFIG_LOSETUP": "n",
               "CONFIG_READAHEAD": "n",
               "CONFIG_SETSERIAL": "n",
@@ -250,7 +307,6 @@ jobs:
               "CONFIG_BLOCKDEV": "n",
               "CONFIG_EJECT": "n",
 
-              # Other unnecessary applets
               "CONFIG_TAR": "n",
               "CONFIG_GZIP": "n",
               "CONFIG_BZIP2": "n",
@@ -259,7 +315,6 @@ jobs:
               "CONFIG_AR": "n",
               "CONFIG_UNZIP": "n",
 
-              # Avoid optional libc-heavy features.
               "CONFIG_FEATURE_USE_BSS_TAIL": "n",
               "CONFIG_FLOAT_DURATION": "n",
               "CONFIG_FEATURE_RTMINMAX": "n",
@@ -269,11 +324,9 @@ jobs:
           }
 
           def emit(key, value):
-              return (
-                  f"# {key} is not set"
-                  if value == "n"
-                  else f"{key}={value}"
-              )
+              if value == "n":
+                  return f"# {key} is not set"
+              return f"{key}={value}"
 
           out = []
           seen = set()
@@ -287,7 +340,10 @@ jobs:
                       seen.add(key)
                       continue
 
-              if line.startswith("# CONFIG_") and line.endswith(" is not set"):
+              if (
+                  line.startswith("# CONFIG_")
+                  and line.endswith(" is not set")
+              ):
                   key = line[2:-11]
 
                   if key in wanted:
@@ -304,324 +360,220 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-      - name: Normalize BusyBox config
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd busybox-src
-
-          # Use a short-lived producer and capture only make's exit code.
           set +e
+
           yes "" | make oldconfig > /tmp/busybox-oldconfig.log 2>&1
-          status=("${PIPESTATUS[@]}")
-          make_rc="${status[1]}"
+
+          pipe_status=("${PIPESTATUS[@]}")
+          make_rc="${pipe_status[1]}"
+
           set -e
 
           cat /tmp/busybox-oldconfig.log
 
           if [ "${make_rc}" -ne 0 ]; then
-            echo "BusyBox oldconfig failed: ${make_rc}"
-            exit "${make_rc}"
+              echo "BusyBox oldconfig failed with exit code ${make_rc}"
+              exit "${make_rc}"
           fi
 
           if grep -Eq \
-            '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=y$' \
-            .config; then
-            echo "ERROR: forbidden util-linux applet enabled"
-            grep -E '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=' .config || true
-            exit 1
+              '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=y$' \
+              .config; then
+              echo "ERROR: Android-incompatible mount applet enabled"
+              exit 1
           fi
 
-      - name: Build BusyBox ARM64 Android
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd busybox-src
-
-          TOOLCHAIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          export PATH="${TOOLCHAIN}:${PATH}"
-          export CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
-          export HOSTCC="cc"
-          export AR="$(command -v ar)"
-          export RANLIB="$(command -v ranlib)"
-          export STRIP="${TOOLCHAIN}/llvm-strip"
-
-          export CFLAGS="${CFLAGS:-}"
-          export CXXFLAGS="${CXXFLAGS:-}"
-          export LDFLAGS="${LDFLAGS:-}"
-
-          CFLAGS="$(printf '%s' "$CFLAGS" \
-            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
-
-          CXXFLAGS="$(printf '%s' "$CXXFLAGS" \
-            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
-
-          LDFLAGS="$(printf '%s' "$LDFLAGS" \
-            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
-
-          export CFLAGS
-          export CXXFLAGS
-          export LDFLAGS
-
           make V=1 -j1 \
-            CC="$CC" \
-            HOSTCC="$HOSTCC" \
-            AR="$AR" \
-            RANLIB="$RANLIB" \
-            STRIP="$STRIP"
+            CC="${CC}" \
+            HOSTCC="cc" \
+            AR="${AR}" \
+            RANLIB="${RANLIB}" \
+            STRIP="${STRIP}" \
+            CFLAGS="-Os -fPIE -D__ANDROID_API__=30" \
+            LDFLAGS="-pie"
 
           test -x busybox
 
-          file busybox
+          mkdir -p "$(dirname "${OUT}")"
 
-          readelf -h busybox | grep -E \
-            "Class:.*ELF64|Machine:.*AArch64"
+          cp busybox "${OUT}"
+          chmod 755 "${OUT}"
 
-          readelf -l busybox \
-            | grep -q "Requesting program interpreter"
+          "${STRIP}" "${OUT}" || true
 
-      - name: Patch Kotlin source before Gradle
+          file "${OUT}"
+
+          "${TOOLCHAIN}/llvm-readelf" -h "${OUT}" \
+            | grep -E "Class:|Machine:|Type:"
+
+          for applet in \
+              ip \
+              arp \
+              arping \
+              ifconfig \
+              route \
+              udhcpc \
+              ping \
+              ps \
+              ls \
+              readlink \
+              modprobe \
+              insmod; do
+
+              "${OUT}" --list | grep -qx "${applet}" || {
+                  echo "Missing BusyBox applet: ${applet}"
+                  exit 1
+              }
+          done
+          SCRIPT
+
+          chmod 755 scripts/build-busybox.sh
+          bash -n scripts/build-busybox.sh
+
+      - name: Build BusyBox ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./scripts/build-busybox.sh
+
+      - name: Verify embedded tools
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="app/src/main/java/com/r36s/usb0manager/MonitorService.kt"
+          test -s app/src/main/assets/tools/arm64-v8a/busybox
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-native
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper
+          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper.sh
 
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: $FILE not found"
-            exit 1
-          fi
+          file app/src/main/assets/tools/arm64-v8a/busybox
+          file app/src/main/assets/tools/arm64-v8a/usb0-native
 
-          python3 - "$FILE" <<'PY'
-          from pathlib import Path
-          import sys
+      - name: Create CI signing key
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          path = Path(sys.argv[1])
-          text = path.read_text()
+          keytool -genkeypair \
+            -keystore "${RUNNER_TEMP}/usb0-manager-release.jks" \
+            -storepass changeit \
+            -keypass changeit \
+            -alias usb0 \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=USB0 Manager, OU=R36S, O=USB0 Manager, L=R36S, ST=R36S, C=GB" \
+            -noprompt
 
-          old = '''    private fun runHelper(command: String): String = try {
-        val helper = HelperManager.install(this).helper
-        val q = "'${helper.absolutePath.replace("'", "'\\\\''")}' $command"
-        var last = "no su"
-        for (su in listOf("/system/xbin/su", "/system/bin/su", "/vendor/bin/su", "su")) {
-            try {
-                val p = Runtime.getRuntime().exec(arrayOf(su, "-c", q))
-                val out = p.inputStream.bufferedReader().readText()
-                val err = p.errorStream.bufferedReader().readText()
-                p.waitFor()
-                if (p.exitValue() == 0 || out.isNotBlank()) return out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""
-                last = err.ifBlank { "su exit=${p.exitValue()}" }
-            } catch (e: Exception) {
-                last = e.message ?: "su failed"
-            }
-        }
-        "root-error=$last"
-    } catch (e: Exception) {
-        "root-error=${e.message}"
-    }'''
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          new = '''    private fun runHelper(command: String): String {
-        return try {
-            val helper = HelperManager.install(this).helper
-            val q = "'${helper.absolutePath.replace("'", "'\\\\''")}' $command"
-            var last = "no su"
-
-            for (su in listOf("/system/xbin/su", "/system/bin/su", "/vendor/bin/su", "su")) {
-                try {
-                    val p = Runtime.getRuntime().exec(arrayOf(su, "-c", q))
-                    val out = p.inputStream.bufferedReader().readText()
-                    val err = p.errorStream.bufferedReader().readText()
-                    p.waitFor()
-
-                    if (p.exitValue() == 0 || out.isNotBlank()) {
-                        return out + if (err.isNotBlank()) {
-                            "\\n[stderr]\\n$err"
-                        } else {
-                            ""
-                        }
-                    }
-
-                    last = err.ifBlank { "su exit=${p.exitValue()}" }
-                } catch (e: Exception) {
-                    last = e.message ?: "su failed"
-                }
-            }
-
-            "root-error=$last"
-        } catch (e: Exception) {
-            "root-error=${e.message}"
-        }
-    }'''
-
-          if old in text:
-              path.write_text(text.replace(old, new, 1))
-              print("MonitorService.runHelper converted to block body.")
-              raise SystemExit(0)
-
-          # Also support the same function if whitespace/formatting changed.
-          start = text.find("private fun runHelper(command: String): String = try")
-
-          if start >= 0:
-              # Find the function by brace balancing.
-              tail = text[start:]
-              first_brace = tail.find("{")
-              if first_brace >= 0:
-                  depth = 0
-                  end = None
-
-                  for i in range(first_brace, len(tail)):
-                      if tail[i] == "{":
-                          depth += 1
-                      elif tail[i] == "}":
-                          depth -= 1
-                          if depth == 0:
-                              end = i + 1
-                              break
-
-                  if end is not None:
-                      function = tail[:end]
-
-                      function = function.replace(
-                          "private fun runHelper(command: String): String = try",
-                          "private fun runHelper(command: String): String {\n    return try",
-                          1
-                      )
-
-                      if function.endswith("}"):
-                          function = function[:-1] + "\n}"
-
-                      path.write_text(text[:start] + function + tail[end:])
-                      print("MonitorService.runHelper converted using fallback parser.")
-                      raise SystemExit(0)
-
-          raise SystemExit(
-              "ERROR: could not locate runHelper() in MonitorService.kt"
+          while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
+            bash -n "${file}"
+          done < <(
+            find scripts app/src/main/assets \
+              -type f \
+              -name "*.sh" \
+              -print0
           )
-          PY
 
-          # The exact compiler error that triggered this build must now be impossible.
-          if grep -n \
-            "private fun runHelper(command: String): String = try" \
-            "$FILE"; then
-            echo "ERROR: expression-body runHelper still exists"
-            exit 1
-          fi
-
-          echo "Kotlin source patch verified."
-
-      - name: Force Java/Kotlin JVM 17
+      - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
-
-          cat > gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          kotlin.code.style=official
-          EOF
-
-          cat > android-build-fix.gradle <<'EOF'
-          import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-
-          allprojects {
-              tasks.withType(JavaCompile).configureEach {
-                  options.release.set(17)
-              }
-
-              tasks.withType(KotlinCompile).configureEach {
-                  compilerOptions {
-                      jvmTarget.set(
-                          org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
-                      )
-                  }
-              }
-          }
-          EOF
-
-          # Inject the compatibility script through the existing root build file.
-          python3 - <<'PY'
-          from pathlib import Path
-
-          candidates = [
-              Path("build.gradle"),
-              Path("build.gradle.kts"),
-          ]
-
-          existing = [p for p in candidates if p.exists()]
-
-          if not existing:
-              raise SystemExit("ERROR: root Gradle build file not found")
-
-          gradle = existing[0]
-          text = gradle.read_text()
-
-          marker = "android-build-fix.gradle"
-
-          if marker not in text:
-              text += '\napply from: "android-build-fix.gradle"\n'
-              gradle.write_text(text)
-
-          print(f"Gradle JVM target fix installed in {gradle}")
-          PY
-
-      - name: Build APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod 755 ./gradlew
 
           bash ./gradlew \
             clean \
             assembleDebug \
-            assembleRelease \
-            --stacktrace \
-            --no-daemon
+            --no-daemon \
+            --stacktrace
 
-      - name: Verify APK
+      - name: Build release APK
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t APKS < <(
-            find . -type f -name "*.apk" | sort
-          )
+          bash ./gradlew \
+            assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            -PRELEASE_STORE_FILE="${RUNNER_TEMP}/usb0-manager-release.jks" \
+            -PRELEASE_STORE_PASSWORD=changeit \
+            -PRELEASE_KEY_ALIAS=usb0 \
+            -PRELEASE_KEY_PASSWORD=changeit
 
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "ERROR: no APK produced"
-            exit 1
-          fi
+      - name: Verify APKs
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          for APK in "${APKS[@]}"; do
-            echo "Verifying ${APK}"
+          APKSIGNER="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
 
-            unzip -l "${APK}" \
-              | grep -q "assets/tools/arm64-v8a/busybox"
+          for apk in \
+              app/build/outputs/apk/debug/*.apk \
+              app/build/outputs/apk/release/*.apk; do
 
-            unzip -l "${APK}" \
-              | grep -q "assets/tools/arm64-v8a/usb0-native"
+              [ -f "${apk}" ] || continue
 
-            unzip -l "${APK}" \
-              | grep -q "assets/tools/arm64-v8a/manifest.txt"
+              echo "Checking ${apk}"
+
+              "${APKSIGNER}" verify "${apk}"
+
+              unzip -l "${apk}" \
+                | grep -F \
+                  "assets/tools/arm64-v8a/busybox"
+
+              unzip -l "${apk}" \
+                | grep -F \
+                  "assets/tools/arm64-v8a/usb0-native"
+
+              unzip -l "${apk}" \
+                | grep -F \
+                  "assets/tools/arm64-v8a/usb0-helper.sh"
           done
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: USB0-Manager-APK
-          path: |
-            **/build/outputs/apk/debug/*.apk
-            **/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload BusyBox
+          mkdir -p artifacts
+
+          cp \
+            app/build/outputs/apk/debug/*.apk \
+            artifacts/
+
+          cp \
+            app/build/outputs/apk/release/*.apk \
+            artifacts/
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: USB0-Manager-BusyBox-ARM64
+          name: usb0-manager-v1.8.1
+          path: artifacts/*.apk
+          retention-days: 30
+
+      - name: Publish release APKs on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb0-manager-v1.8.1-diagnostics
           path: |
-            busybox-src/busybox
-            busybox-src/.config
-            app/src/main/assets/tools/arm64-v8a/manifest.txt
+            app/build/reports/**
+            app/build/outputs/**
+            /tmp/busybox-oldconfig.log
+            ~/.gradle/daemon/**
+          if-no-files-found: ignore
+          retention-days: 7
