@@ -1,13 +1,13 @@
 name: Build USB0 Manager v1.8.1
 
 "on":
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches:
       - main
       - master
     tags:
-      - 'v*'
+      - "v*"
   pull_request:
     branches:
       - main
@@ -21,11 +21,12 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      ANDROID_API_LEVEL: '35'
-      ANDROID_BUILD_TOOLS: '35.0.0'
-      ANDROID_NDK_VERSION: '27.2.12479018'
+      ANDROID_API_LEVEL: "35"
+      ANDROID_BUILD_TOOLS: "35.0.0"
+      ANDROID_NDK_VERSION: "27.2.12479018"
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -33,31 +34,30 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK and NDK
+      - name: Install Android SDK
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "ndk;${ANDROID_NDK_VERSION}"
+          sdkmanager "platform-tools"
+          sdkmanager "platforms;android-${ANDROID_API_LEVEL}"
+          sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
 
-      - name: Prepare Gradle wrapper
+      - name: Prepare Gradle
         shell: bash
         run: |
           set -euo pipefail
           chmod 755 ./gradlew
-          bash ./gradlew --version
+          ./gradlew --version
 
-      - name: Configure Kotlin and Java for JVM 17
+      - name: Configure Java and Kotlin
         shell: bash
         run: |
           set -euo pipefail
@@ -76,28 +76,23 @@ jobs:
 
           if "kotlinOptions" not in s:
               block = """
-          kotlinOptions {
-              jvmTarget = '17'
-          }
-          """
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+              """
+
               if "android {" in s:
                   s = s.replace("android {", "android {" + block, 1)
               else:
                   s += "\n" + block
 
           p.write_text(s)
-
-          for f in (
-              Path("android-build-fix.gradle"),
-              Path("app/android-build-fix.gradle"),
-          ):
-              if f.exists():
-                  f.unlink()
-
-          print("Kotlin/Java configuration updated.")
           PY
 
-      - name: Fix known Kotlin source compatibility issues
+          rm -f android-build-fix.gradle
+          rm -f app/android-build-fix.gradle
+
+      - name: Fix Kotlin compatibility
         shell: bash
         run: |
           set -euo pipefail
@@ -107,72 +102,11 @@ jobs:
 
           for p in Path("app/src").rglob("*.kt"):
               s = p.read_text()
-
               s = s.replace("singleLine = true", "isSingleLine = true")
-
-              marker = "private fun runHelper(command: String)"
-              pos = s.find(marker)
-
-              if pos >= 0:
-                  brace = s.find("{", pos)
-
-                  if brace >= 0:
-                      depth = 0
-                      end = None
-
-                      for i in range(brace, len(s)):
-                          if s[i] == "{":
-                              depth += 1
-                          elif s[i] == "}":
-                              depth -= 1
-                              if depth == 0:
-                                  end = i + 1
-                                  break
-
-                      if end is not None:
-                          prefix = s[max(0, pos - 20):brace]
-
-                          if " = try {" in prefix:
-                              start = s.rfind("private fun", 0, pos)
-
-                              replacement = """private fun runHelper(command: String): String {
-          return try {
-              val helper = HelperManager.install(this).helper
-              val q = "'${helper.absolutePath.replace("'", "'\\\\''")}' $command"
-              var last = "no su"
-
-              for (su in listOf("/system/xbin/su", "/system/bin/su", "/vendor/bin/su", "su")) {
-                  try {
-                      val process = Runtime.getRuntime().exec(arrayOf(su, "-c", q))
-                      val out = process.inputStream.bufferedReader().readText()
-                      val err = process.errorStream.bufferedReader().readText()
-                      process.waitFor()
-
-                      if (process.exitValue() == 0 || out.isNotBlank()) {
-                          return out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""
-                      }
-
-                      last = err.ifBlank {
-                          "su exit=${process.exitValue()}"
-                      }
-                  } catch (e: Exception) {
-                      last = e.message ?: "su failed"
-                  }
-              }
-
-              "root-error=$last"
-          } catch (e: Exception) {
-              "root-error=${e.message}"
-          }
-      }"""
-
-                              s = s[:start] + replacement + s[end:]
-                              print("Updated", p)
-
               p.write_text(s)
           PY
 
-      - name: Build and bundle BusyBox and helper tools
+      - name: Build BusyBox
         shell: bash
         run: |
           set -euo pipefail
@@ -183,18 +117,21 @@ jobs:
             chmod 755 scripts/build-busybox.sh
             ./scripts/build-busybox.sh
           else
-            echo "scripts/build-busybox.sh not found; keeping existing bundled tools."
+            echo "BusyBox build script not found."
           fi
+
+      - name: Build usb0-native
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p app/src/main/assets/tools/arm64-v8a
 
           if [ -f app/src/main/cpp/usb0-native.c ]; then
             NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
             TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-            CLANG="$TOOLCHAIN/aarch64-linux-android30-clang"
-            STRIP="$TOOLCHAIN/llvm-strip"
-            READELF="$TOOLCHAIN/llvm-readelf"
-
-            "$CLANG" \
+            "$TOOLCHAIN/aarch64-linux-android30-clang" \
               -O2 \
               -fPIE \
               -fstack-protector-strong \
@@ -204,45 +141,36 @@ jobs:
               app/src/main/cpp/usb0-native.c \
               -o app/src/main/assets/tools/arm64-v8a/usb0-native
 
-            "$STRIP" \
+            "$TOOLCHAIN/llvm-strip" \
               app/src/main/assets/tools/arm64-v8a/usb0-native || true
 
             chmod 755 \
               app/src/main/assets/tools/arm64-v8a/usb0-native
-
-            "$READELF" \
-              -h app/src/main/assets/tools/arm64-v8a/usb0-native |
-              grep -E 'Class:|Machine:|Type:'
           fi
 
-      - name: Verify embedded tools
+      - name: Check embedded files
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s app/src/main/assets/tools/arm64-v8a/busybox
-          echo "BusyBox present."
+          if [ -f app/src/main/assets/tools/arm64-v8a/busybox ]; then
+            test -s app/src/main/assets/tools/arm64-v8a/busybox
+            echo "BusyBox OK"
+          fi
 
           if [ -f app/src/main/assets/tools/arm64-v8a/usb0-native ]; then
             test -s app/src/main/assets/tools/arm64-v8a/usb0-native
-            echo "usb0-native present."
+            echo "usb0-native OK"
           fi
 
-          find app/src/main/assets/tools/arm64-v8a \
-            -maxdepth 1 \
-            -type f \
-            -printf '%f\n' |
-            sort
-
-      - name: Compile Kotlin with full diagnostics
+      - name: Compile Kotlin
         shell: bash
         run: |
           set -uo pipefail
 
-          LOG="$RUNNER_TEMP/kotlin-build.log"
+          LOG="$RUNNER_TEMP/kotlin.log"
 
-          bash ./gradlew \
-            :app:compileDebugKotlin \
+          ./gradlew :app:compileDebugKotlin \
             --no-daemon \
             --no-parallel \
             --stacktrace \
@@ -253,11 +181,7 @@ jobs:
           rc=${PIPESTATUS[0]}
 
           echo "===== KOTLIN ERRORS ====="
-
-          grep -E \
-            '(^e: |error:|\.kt:[0-9]+:[0-9]+)' \
-            "$LOG" || true
-
+          grep -E '(^e: |error:|\.kt:[0-9]+:[0-9]+)' "$LOG" || true
           echo "===== END KOTLIN ERRORS ====="
 
           exit "$rc"
@@ -267,10 +191,9 @@ jobs:
         run: |
           set -uo pipefail
 
-          LOG="$RUNNER_TEMP/debug-build.log"
+          LOG="$RUNNER_TEMP/debug.log"
 
-          bash ./gradlew \
-            assembleDebug \
+          ./gradlew assembleDebug \
             --no-daemon \
             --no-parallel \
             --stacktrace \
@@ -280,11 +203,7 @@ jobs:
           rc=${PIPESTATUS[0]}
 
           echo "===== BUILD ERRORS ====="
-
-          grep -E \
-            '(^e: |error:|FAILED|\.kt:[0-9]+:[0-9]+)' \
-            "$LOG" || true
-
+          grep -E '(^e: |error:|FAILED|\.kt:[0-9]+:[0-9]+)' "$LOG" || true
           echo "===== END BUILD ERRORS ====="
 
           exit "$rc"
@@ -294,10 +213,9 @@ jobs:
         run: |
           set -uo pipefail
 
-          LOG="$RUNNER_TEMP/release-build.log"
+          LOG="$RUNNER_TEMP/release.log"
 
-          bash ./gradlew \
-            assembleRelease \
+          ./gradlew assembleRelease \
             --no-daemon \
             --no-parallel \
             --stacktrace \
@@ -306,36 +224,25 @@ jobs:
 
           rc=${PIPESTATUS[0]}
 
-          echo "===== RELEASE BUILD ERRORS ====="
-
-          grep -E \
-            '(^e: |error:|FAILED|\.kt:[0-9]+:[0-9]+)' \
-            "$LOG" || true
-
-          echo "===== END RELEASE BUILD ERRORS ====="
+          echo "===== RELEASE ERRORS ====="
+          grep -E '(^e: |error:|FAILED|\.kt:[0-9]+:[0-9]+)' "$LOG" || true
+          echo "===== END RELEASE ERRORS ====="
 
           exit "$rc"
 
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          find app/build/outputs/apk \
-            -type f \
-            -name '*.apk' \
-            -print \
-            -exec file {} \;
-
-      - name: Collect artifacts
+      - name: Collect APK
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p artifacts
 
-          cp app/build/outputs/apk/debug/*.apk artifacts/
-          cp app/build/outputs/apk/release/*.apk artifacts/
+          find app/build/outputs/apk \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} artifacts/ \;
+
+          ls -lh artifacts
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -348,11 +255,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: usb0-manager-v1.8.1-diagnostics
+          name: usb0-manager-build-diagnostics
           path: |
-            ${{ runner.temp }}/kotlin-build.log
-            ${{ runner.temp }}/debug-build.log
-            ${{ runner.temp }}/release-build.log
+            ${{ runner.temp }}/kotlin.log
+            ${{ runner.temp }}/debug.log
+            ${{ runner.temp }}/release.log
             app/build/reports/**
           if-no-files-found: ignore
           retention-days: 7
