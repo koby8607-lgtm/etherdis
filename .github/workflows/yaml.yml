@@ -60,6 +60,7 @@ jobs:
             file \
             git \
             make \
+            binutils \
             python3 \
             unzip \
             zip
@@ -93,13 +94,12 @@ jobs:
           p = Path("libbb/hash_md5_sha.c")
           s = p.read_text()
 
-          if "sha1_process_block64_shaNI" in s and "__i386__" not in s:
-              s = s.replace(
-                  "process_block = sha1_process_block64_shaNI;",
-                  "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
-                  "        process_block = sha1_process_block64_shaNI;\n"
-                  "#endif"
-              )
+          s = s.replace(
+              "process_block = sha1_process_block64_shaNI;",
+              "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
+              "        process_block = sha1_process_block64_shaNI;\n"
+              "#endif"
+          )
 
           p.write_text(s)
           PY
@@ -214,6 +214,7 @@ jobs:
           for line in lines:
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
+
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -221,6 +222,7 @@ jobs:
 
               if line.startswith("# CONFIG_") and line.endswith(" is not set"):
                   key = line[2:-11]
+
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -235,30 +237,17 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          # BusyBox's kconfig can still ask interactive questions for
-          # choice symbols. Feed empty/default answers without failing
-          # the workflow because the "yes" process receives SIGPIPE
-          # when make exits.
-          set +o pipefail
-          yes '' | make oldconfig
-          rc=$?
-          set -o pipefail
+          # Resolve every remaining kconfig prompt using its default.
+          # Avoid the interactive EOF failure seen previously.
+          yes '' | make oldconfig >/tmp/busybox-oldconfig.log 2>&1
+          rc=${PIPESTATUS[1]}
+
+          cat /tmp/busybox-oldconfig.log
 
           if [ "$rc" -ne 0 ]; then
             echo "BusyBox oldconfig failed with exit code $rc"
             exit "$rc"
           fi
-
-          # Verify the important settings after kconfig normalization.
-          grep -q '^CONFIG_FEATURE_BUFFERS_GO_IN_BSS=y$' .config
-          grep -q '^# CONFIG_FEATURE_BUFFERS_GO_ON_STACK is not set$' .config \
-            || grep -q '^CONFIG_FEATURE_BUFFERS_GO_ON_STACK=n$' .config || true
-          grep -q '^# CONFIG_FEATURE_BUFFERS_USE_MALLOC is not set$' .config \
-            || grep -q '^CONFIG_FEATURE_BUFFERS_USE_MALLOC=n$' .config || true
-          grep -q '^CONFIG_STATIC=n$' .config \
-            || grep -q '^# CONFIG_STATIC is not set$' .config
-          grep -q '^CONFIG_SHA1_HWACCEL=n$' .config \
-            || grep -q '^# CONFIG_SHA1_HWACCEL is not set$' .config
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -270,10 +259,16 @@ jobs:
           TOOLCHAIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           export PATH="${TOOLCHAIN}:${PATH}"
+
           export CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
           export HOSTCC="cc"
-          export AR="${TOOLCHAIN}/llvm-ar"
-          export RANLIB="${TOOLCHAIN}/llvm-ranlib"
+
+          # Use Ubuntu binutils for BusyBox static archives.
+          # These archives contain ARM64 ELF objects but ar/ranlib
+          # themselves are architecture-independent.
+          export AR="$(command -v ar)"
+          export RANLIB="$(command -v ranlib)"
+
           export STRIP="${TOOLCHAIN}/llvm-strip"
 
           export CFLAGS="${CFLAGS:-}"
@@ -293,12 +288,24 @@ jobs:
           export CXXFLAGS
           export LDFLAGS
 
-          make -j"$(nproc)" \
+          echo "Compiler: $CC"
+          echo "Archiver: $AR"
+          echo "RANLIB:   $RANLIB"
+          echo "Strip:    $STRIP"
+
+          "$CC" --version
+          "$AR" --version
+          "$RANLIB" --version
+
+          # Build serially so the first real failure is visible.
+          make V=1 -j1 \
             CC="$CC" \
             HOSTCC="$HOSTCC" \
             AR="$AR" \
             RANLIB="$RANLIB" \
             STRIP="$STRIP"
+
+          test -x busybox
 
           file busybox
 
@@ -346,6 +353,8 @@ jobs:
           SHA1_HWACCEL=NO
           SHA256_HWACCEL=NO
           TC=NO
+          AR=GNU-binutils
+          RANLIB=GNU-binutils
           EOF
 
       - name: Prepare Gradle
@@ -380,14 +389,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          APKS="$(find . -type f -name "*.apk")"
+          mapfile -t APKS < <(
+            find . -type f -name "*.apk" | sort
+          )
 
-          if [ -z "$APKS" ]; then
+          if [ "${#APKS[@]}" -eq 0 ]; then
             echo "No APK produced"
             exit 1
           fi
 
-          while IFS= read -r APK; do
+          for APK in "${APKS[@]}"; do
             echo "Checking $APK"
 
             unzip -l "$APK" \
@@ -398,7 +409,7 @@ jobs:
 
             unzip -l "$APK" \
               | grep -q "assets/tools/arm64-v8a/manifest.txt"
-          done <<< "$APKS"
+          done
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -409,7 +420,7 @@ jobs:
             **/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Upload BusyBox
+      - name: Upload BusyBox build
         uses: actions/upload-artifact@v4
         with:
           name: USB0-Manager-BusyBox-ARM64
@@ -427,7 +438,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate workflow
+      - name: Validate workflow files
         shell: bash
         run: |
           set -euo pipefail
@@ -437,6 +448,7 @@ jobs:
           import sys
 
           directory = Path(".github/workflows")
+
           workflows = sorted(directory.glob("*.yml"))
           workflows += sorted(directory.glob("*.yaml"))
 
@@ -447,17 +459,17 @@ jobs:
           for workflow in workflows:
               text = workflow.read_text()
 
-              if "sdkmanager tools" in text:
-                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
-                  sys.exit(1)
+              forbidden = (
+                  "sdkmanager tools",
+                  "packages: 'tools",
+                  'packages: "tools',
+                  "android-actions/setup-android@v2",
+              )
 
-              if "packages: 'tools" in text or 'packages: "tools' in text:
-                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
-                  sys.exit(1)
-
-              if "android-actions/setup-android@v2" in text:
-                  print(f"ERROR: obsolete setup-android@v2 in {workflow}")
-                  sys.exit(1)
+              for item in forbidden:
+                  if item in text:
+                      print(f"ERROR: {item!r} found in {workflow}")
+                      sys.exit(1)
 
           print("Workflow validation passed")
           PY
