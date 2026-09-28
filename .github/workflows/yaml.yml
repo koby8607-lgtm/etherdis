@@ -40,7 +40,7 @@ jobs:
       - name: Install Android SDK components
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           sdkmanager --install \
             "platform-tools" \
@@ -48,19 +48,22 @@ jobs:
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
 
-      - name: Prepare Gradle
+      - name: Prepare Gradle wrapper
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           test -f ./gradlew
+
           chmod 755 ./gradlew
+
+          test -r ./gradlew
           test -x ./gradlew
 
-      - name: Prepare helper directories
+      - name: Prepare directories
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           mkdir -p \
             app/src/main/assets/tools/arm64-v8a \
@@ -70,98 +73,156 @@ jobs:
       - name: Download BusyBox
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           cd third_party
+
           rm -rf busybox
           mkdir -p busybox
           cd busybox
 
-          curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
-            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" \
-            -o "busybox-${BUSYBOX_VERSION}.tar.bz2"
+          URL="https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2"
+          FILE="busybox-${BUSYBOX_VERSION}.tar.bz2"
 
-          test -s "busybox-${BUSYBOX_VERSION}.tar.bz2"
+          echo "Downloading ${URL}"
 
-          tar -xjf "busybox-${BUSYBOX_VERSION}.tar.bz2"
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --retry 8 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            "${URL}" \
+            --output "${FILE}"
+
+          test -s "${FILE}"
+
+          echo "Downloaded:"
+          ls -lh "${FILE}"
+
+          tar -xjf "${FILE}"
 
           test -d "busybox-${BUSYBOX_VERSION}"
 
-      - name: Configure BusyBox
+      - name: Configure BusyBox without scripts/config
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
           make defconfig
 
-          ./scripts/config --enable STATIC
-          ./scripts/config --enable FEATURE_PREFER_APPLETS
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          ./scripts/config --enable IP
-          ./scripts/config --enable FEATURE_IP_LINK
-          ./scripts/config --enable FEATURE_IP_ROUTE
-          ./scripts/config --enable FEATURE_IP_RULE
-          ./scripts/config --enable FEATURE_IP_NEIGH
-          ./scripts/config --enable FEATURE_IP_ADDRESS
+          config = Path(".config")
+          text = config.read_text()
 
-          ./scripts/config --enable IFCONFIG
-          ./scripts/config --enable IFUP
-          ./scripts/config --enable IFDOWN
-          ./scripts/config --enable ROUTE
+          symbols = [
+              "STATIC",
+              "FEATURE_PREFER_APPLETS",
 
-          ./scripts/config --enable ARP
-          ./scripts/config --enable ARPING
-          ./scripts/config --enable PING
-          ./scripts/config --enable PING6
+              "IP",
+              "FEATURE_IP_LINK",
+              "FEATURE_IP_ROUTE",
+              "FEATURE_IP_RULE",
+              "FEATURE_IP_NEIGH",
+              "FEATURE_IP_ADDRESS",
 
-          ./scripts/config --enable UDHCPC
-          ./scripts/config --enable UDHCPD
+              "IFCONFIG",
+              "IFUP",
+              "IFDOWN",
+              "ROUTE",
 
-          ./scripts/config --enable MODPROBE
-          ./scripts/config --enable INSMOD
-          ./scripts/config --enable RMMOD
+              "ARP",
+              "ARPING",
 
-          ./scripts/config --enable LS
-          ./scripts/config --enable CAT
-          ./scripts/config --enable CP
-          ./scripts/config --enable MV
-          ./scripts/config --enable RM
-          ./scripts/config --enable MKDIR
-          ./scripts/config --enable READLINK
-          ./scripts/config --enable GREP
-          ./scripts/config --enable SED
-          ./scripts/config --enable AWK
-          ./scripts/config --enable SLEEP
-          ./scripts/config --enable DATE
-          ./scripts/config --enable LOGGER
-          ./scripts/config --enable SH
-          ./scripts/config --enable ASH
-          ./scripts/config --enable ENV
-          ./scripts/config --enable PRINTENV
-          ./scripts/config --enable UNAME
-          ./scripts/config --enable KILL
-          ./scripts/config --enable PS
+              "PING",
+              "PING6",
+
+              "UDHCPC",
+              "UDHCPD",
+
+              "MODPROBE",
+              "INSMOD",
+              "RMMOD",
+
+              "LS",
+              "CAT",
+              "CP",
+              "MV",
+              "RM",
+              "MKDIR",
+              "READLINK",
+              "GREP",
+              "SED",
+              "AWK",
+              "SLEEP",
+              "DATE",
+              "LOGGER",
+              "SH",
+              "ASH",
+              "ENV",
+              "PRINTENV",
+              "UNAME",
+              "KILL",
+              "PS",
+          ]
+
+          def enable_symbol(src: str, symbol: str) -> str:
+              pattern = rf'^(?:# )?CONFIG_{re.escape(symbol)}(?:=.*| is not set)$'
+              replacement = f"CONFIG_{symbol}=y"
+
+              if re.search(pattern, src, flags=re.MULTILINE):
+                  return re.sub(
+                      pattern,
+                      replacement,
+                      src,
+                      count=1,
+                      flags=re.MULTILINE
+                  )
+
+              # The symbol may legitimately not exist in this BusyBox
+              # configuration/version. Do not inject unknown symbols.
+              return src
+
+          for symbol in symbols:
+              text = enable_symbol(text, symbol)
+
+          config.write_text(text)
+
+          print("BusyBox configuration updated.")
+          PY
 
           make olddefconfig
 
-      - name: Build BusyBox ARM64
+          echo
+          echo "Enabled BusyBox applets:"
+          grep -E \
+            '^(CONFIG_(STATIC|IP|FEATURE_IP_|IFCONFIG|IFUP|IFDOWN|ROUTE|ARP|ARPING|PING|PING6|UDHCPC|UDHCPD|MODPROBE|INSMOD|RMMOD))=' \
+            .config || true
+
+      - name: Build BusyBox for ARM64 Android
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
+          test -d "${TOOLCHAIN}"
+
           test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
           test -x "${TOOLCHAIN}/llvm-ar"
           test -x "${TOOLCHAIN}/llvm-ranlib"
+          test -x "${TOOLCHAIN}/llvm-strip"
+          test -x "${TOOLCHAIN}/llvm-readelf"
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
-
-          export PATH="${TOOLCHAIN}:${PATH}"
 
           make -j"$(nproc)" \
             ARCH=arm64 \
@@ -172,45 +233,52 @@ jobs:
 
           test -f busybox
 
-          file busybox
+          "${TOOLCHAIN}/llvm-readelf" -h busybox |
+            grep -q "Class:.*ELF64"
 
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
-            grep -E "Class:.*ELF64|Machine:.*AArch64"
+            grep -q "Machine:.*AArch64"
 
-          cp busybox \
+          cp \
+            busybox \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
           chmod 755 \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
-      - name: Build native ARM64 helper
+      - name: Build USB0 native ARM64 helper
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          mkdir -p app/src/main/assets/tools/arm64-v8a
+          test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
 
           SRC=""
 
-          if [ -f app/src/main/cpp/usb0-native.c ]; then
+          if [[ -f app/src/main/cpp/usb0-native.c ]]; then
             SRC="app/src/main/cpp/usb0-native.c"
-          elif [ -f app/src/main/cpp/usb0_helper.c ]; then
+          elif [[ -f app/src/main/cpp/usb0_helper.c ]]; then
             SRC="app/src/main/cpp/usb0_helper.c"
-          elif [ -f app/src/main/cpp/native_helper.c ]; then
+          elif [[ -f app/src/main/cpp/native_helper.c ]]; then
             SRC="app/src/main/cpp/native_helper.c"
           fi
 
-          if [ -z "${SRC}" ]; then
-            echo "No native helper source found; creating helper launcher"
+          if [[ -z "${SRC}" ]]; then
+            echo "No native C helper source found."
+            echo "The bundled BusyBox will be used by the shell recovery layer."
+
             cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
-          exec "${0%/*}/busybox" "$@"
+          HERE="${0%/*}"
+          exec "${HERE}/busybox" "$@"
           EOF
+
             chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
+
           else
             "${TOOLCHAIN}/aarch64-linux-android30-clang" \
               -O2 \
@@ -225,32 +293,34 @@ jobs:
             chmod 755 \
               app/src/main/assets/tools/arm64-v8a/usb0-native
 
-            file \
-              app/src/main/assets/tools/arm64-v8a/usb0-native
+            "${TOOLCHAIN}/llvm-readelf" -h \
+              app/src/main/assets/tools/arm64-v8a/usb0-native |
+              grep -q "Class:.*ELF64"
 
             "${TOOLCHAIN}/llvm-readelf" -h \
               app/src/main/assets/tools/arm64-v8a/usb0-native |
-              grep -E "Class:.*ELF64|Machine:.*AArch64"
+              grep -q "Machine:.*AArch64"
           fi
 
-      - name: Write helper manifest
+      - name: Create helper manifest
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
-          USB0 Manager helper bundle
+          USB0 Manager ARM64 helper bundle
           ABI=arm64-v8a
-          BUSYBOX_VERSION=${BUSYBOX_VERSION}
-          NATIVE_HELPER=usb0-native
+          BUSYBOX=${BUSYBOX_VERSION}
+          NativeHelper=usb0-native
           EOF
 
-          test -s app/src/main/assets/tools/arm64-v8a/manifest.txt
+          test -s \
+            app/src/main/assets/tools/arm64-v8a/manifest.txt
 
       - name: Create JVM compatibility configuration
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           cat > ci-jvm-targets.gradle <<'EOF'
           import org.gradle.api.tasks.compile.JavaCompile
@@ -279,9 +349,10 @@ jobs:
                               def compilerOptions = task.compilerOptions
                               def jvmTarget = compilerOptions.jvmTarget
 
-                              def target17 = jvmTarget.get().class.enumConstants.find {
-                                  it.toString() == "JVM_17"
-                              }
+                              def target17 =
+                                  jvmTarget.get().class.enumConstants.find {
+                                      it.toString() == "JVM_17"
+                                  }
 
                               if (target17 != null) {
                                   jvmTarget.set(target17)
@@ -294,21 +365,43 @@ jobs:
           }
           EOF
 
-      - name: Verify project
+      - name: Verify Android project
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          test -f settings.gradle || test -f settings.gradle.kts
-          test -f build.gradle || test -f build.gradle.kts
+          if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
+            echo "ERROR: Android Gradle settings file not found"
+            exit 1
+          fi
+
+          if [[ ! -f build.gradle && ! -f build.gradle.kts ]]; then
+            echo "ERROR: Android Gradle build file not found"
+            exit 1
+          fi
+
+      - name: Verify bundled tools
+        shell: bash
+        run: |
+          set -euo pipefail
 
           test -f app/src/main/assets/tools/arm64-v8a/busybox
           test -f app/src/main/assets/tools/arm64-v8a/usb0-native
 
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/busybox \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          file \
+            app/src/main/assets/tools/arm64-v8a/busybox
+
+          file \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
       - name: Build debug APK
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           bash ./gradlew \
             clean \
@@ -320,7 +413,7 @@ jobs:
       - name: Build release APK
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           bash ./gradlew \
             assembleRelease \
@@ -328,22 +421,25 @@ jobs:
             --stacktrace \
             -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
 
-      - name: Verify APKs
+      - name: Verify generated APKs
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           mkdir -p artifacts
 
-          found=0
+          DEBUG_APK=""
+          RELEASE_APK=""
 
           while IFS= read -r -d '' apk; do
-            echo "Found APK: ${apk}"
-
-            name="$(basename "${apk}")"
-            cp "${apk}" "artifacts/${name}"
-
-            found=1
+            case "${apk}" in
+              */build/outputs/apk/debug/*.apk)
+                DEBUG_APK="${apk}"
+                ;;
+              */build/outputs/apk/release/*.apk)
+                RELEASE_APK="${apk}"
+                ;;
+            esac
           done < <(
             find . \
               -type f \
@@ -351,23 +447,47 @@ jobs:
               -print0
           )
 
-          if [ "${found}" -eq 0 ]; then
-            echo "ERROR: No APK files produced"
-            find . -type f -path '*/build/outputs/*' -print || true
+          if [[ -z "${DEBUG_APK}" ]]; then
+            echo "ERROR: Debug APK was not produced"
+            find . \
+              -type f \
+              -path '*/build/outputs/*' \
+              -print || true
             exit 1
           fi
+
+          if [[ -z "${RELEASE_APK}" ]]; then
+            echo "ERROR: Release APK was not produced"
+            find . \
+              -type f \
+              -path '*/build/outputs/*' \
+              -print || true
+            exit 1
+          fi
+
+          cp "${DEBUG_APK}" artifacts/app-debug.apk
+          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
+
+          ls -lh artifacts/*.apk
+
+      - name: Verify embedded BusyBox
+        shell: bash
+        run: |
+          set -euo pipefail
 
           for apk in artifacts/*.apk; do
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/busybox"
+              grep -F \
+                "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/usb0-native"
+              grep -F \
+                "assets/tools/arm64-v8a/usb0-native"
           done
 
-      - name: Upload APKs
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: USB0-Manager-APKs
