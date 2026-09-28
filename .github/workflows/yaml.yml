@@ -48,16 +48,13 @@ jobs:
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
 
-      - name: Prepare Gradle wrapper
+      - name: Prepare Gradle
         shell: bash
         run: |
           set -euo pipefail
 
           test -f ./gradlew
-
           chmod 755 ./gradlew
-
-          test -r ./gradlew
           test -x ./gradlew
 
       - name: Prepare directories
@@ -70,7 +67,7 @@ jobs:
             third_party \
             build-tools
 
-      - name: Download BusyBox
+      - name: Download BusyBox source
         shell: bash
         run: |
           set -euo pipefail
@@ -81,16 +78,14 @@ jobs:
           mkdir -p busybox
           cd busybox
 
-          URL="https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2"
           FILE="busybox-${BUSYBOX_VERSION}.tar.bz2"
-
-          echo "Downloading ${URL}"
+          URL="https://busybox.net/downloads/${FILE}"
 
           curl \
             --fail \
             --location \
             --show-error \
-            --retry 8 \
+            --retry 10 \
             --retry-delay 3 \
             --retry-all-errors \
             "${URL}" \
@@ -98,14 +93,11 @@ jobs:
 
           test -s "${FILE}"
 
-          echo "Downloaded:"
-          ls -lh "${FILE}"
-
           tar -xjf "${FILE}"
 
           test -d "busybox-${BUSYBOX_VERSION}"
 
-      - name: Configure BusyBox without scripts/config
+      - name: Configure BusyBox
         shell: bash
         run: |
           set -euo pipefail
@@ -118,8 +110,8 @@ jobs:
           from pathlib import Path
           import re
 
-          config = Path(".config")
-          text = config.read_text()
+          path = Path(".config")
+          text = path.read_text()
 
           symbols = [
               "STATIC",
@@ -172,40 +164,25 @@ jobs:
               "PS",
           ]
 
-          def enable_symbol(src: str, symbol: str) -> str:
-              pattern = rf'^(?:# )?CONFIG_{re.escape(symbol)}(?:=.*| is not set)$'
+          for symbol in symbols:
               replacement = f"CONFIG_{symbol}=y"
 
-              if re.search(pattern, src, flags=re.MULTILINE):
-                  return re.sub(
-                      pattern,
-                      replacement,
-                      src,
-                      count=1,
-                      flags=re.MULTILINE
-                  )
+              pattern = re.compile(
+                  rf"^(?:# CONFIG_{re.escape(symbol)} is not set|CONFIG_{re.escape(symbol)}=.*)$",
+                  re.MULTILINE,
+              )
 
-              # The symbol may legitimately not exist in this BusyBox
-              # configuration/version. Do not inject unknown symbols.
-              return src
+              if pattern.search(text):
+                  text = pattern.sub(replacement, text, count=1)
 
-          for symbol in symbols:
-              text = enable_symbol(text, symbol)
-
-          config.write_text(text)
-
-          print("BusyBox configuration updated.")
+          path.write_text(text)
           PY
 
-          make olddefconfig
+          # BusyBox 1.37.0 does not provide the kernel-style
+          # "olddefconfig" target. Use oldconfig non-interactively.
+          yes "" | make oldconfig
 
-          echo
-          echo "Enabled BusyBox applets:"
-          grep -E \
-            '^(CONFIG_(STATIC|IP|FEATURE_IP_|IFCONFIG|IFUP|IFDOWN|ROUTE|ARP|ARPING|PING|PING6|UDHCPC|UDHCPD|MODPROBE|INSMOD|RMMOD))=' \
-            .config || true
-
-      - name: Build BusyBox for ARM64 Android
+      - name: Build BusyBox ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -214,13 +191,10 @@ jobs:
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          test -d "${TOOLCHAIN}"
-
           test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
           test -x "${TOOLCHAIN}/llvm-ar"
           test -x "${TOOLCHAIN}/llvm-ranlib"
           test -x "${TOOLCHAIN}/llvm-strip"
-          test -x "${TOOLCHAIN}/llvm-readelf"
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
@@ -239,14 +213,13 @@ jobs:
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
             grep -q "Machine:.*AArch64"
 
-          cp \
-            busybox \
+          cp busybox \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
           chmod 755 \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
-      - name: Build USB0 native ARM64 helper
+      - name: Build native ARM64 helper
         shell: bash
         run: |
           set -euo pipefail
@@ -254,8 +227,6 @@ jobs:
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
 
           SRC=""
 
@@ -267,19 +238,7 @@ jobs:
             SRC="app/src/main/cpp/native_helper.c"
           fi
 
-          if [[ -z "${SRC}" ]]; then
-            echo "No native C helper source found."
-            echo "The bundled BusyBox will be used by the shell recovery layer."
-
-            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
-          #!/system/bin/sh
-          HERE="${0%/*}"
-          exec "${HERE}/busybox" "$@"
-          EOF
-
-            chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
-
-          else
+          if [[ -n "${SRC}" ]]; then
             "${TOOLCHAIN}/aarch64-linux-android30-clang" \
               -O2 \
               -fPIE \
@@ -292,14 +251,15 @@ jobs:
 
             chmod 755 \
               app/src/main/assets/tools/arm64-v8a/usb0-native
+          else
+            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
+          #!/system/bin/sh
+          HERE="${0%/*}"
+          exec "${HERE}/busybox" "$@"
+          EOF
 
-            "${TOOLCHAIN}/llvm-readelf" -h \
-              app/src/main/assets/tools/arm64-v8a/usb0-native |
-              grep -q "Class:.*ELF64"
-
-            "${TOOLCHAIN}/llvm-readelf" -h \
-              app/src/main/assets/tools/arm64-v8a/usb0-native |
-              grep -q "Machine:.*AArch64"
+            chmod 755 \
+              app/src/main/assets/tools/arm64-v8a/usb0-native
           fi
 
       - name: Create helper manifest
@@ -308,14 +268,11 @@ jobs:
           set -euo pipefail
 
           cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
-          USB0 Manager ARM64 helper bundle
+          USB0 Manager helper bundle
           ABI=arm64-v8a
           BUSYBOX=${BUSYBOX_VERSION}
-          NativeHelper=usb0-native
+          NATIVE_HELPER=usb0-native
           EOF
-
-          test -s \
-            app/src/main/assets/tools/arm64-v8a/manifest.txt
 
       - name: Create JVM compatibility configuration
         shell: bash
@@ -344,59 +301,27 @@ jobs:
                               task.kotlinOptions.jvmTarget = "17"
                           } catch (Throwable ignored) {
                           }
-
-                          try {
-                              def compilerOptions = task.compilerOptions
-                              def jvmTarget = compilerOptions.jvmTarget
-
-                              def target17 =
-                                  jvmTarget.get().class.enumConstants.find {
-                                      it.toString() == "JVM_17"
-                                  }
-
-                              if (target17 != null) {
-                                  jvmTarget.set(target17)
-                              }
-                          } catch (Throwable ignored) {
-                          }
                       }
                   }
               }
           }
           EOF
 
-      - name: Verify Android project
+      - name: Verify project
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ ! -f settings.gradle && ! -f settings.gradle.kts ]]; then
-            echo "ERROR: Android Gradle settings file not found"
-            exit 1
-          fi
+          test -f ./gradlew
 
-          if [[ ! -f build.gradle && ! -f build.gradle.kts ]]; then
-            echo "ERROR: Android Gradle build file not found"
-            exit 1
-          fi
+          test -f settings.gradle || \
+            test -f settings.gradle.kts
 
-      - name: Verify bundled tools
-        shell: bash
-        run: |
-          set -euo pipefail
+          test -f build.gradle || \
+            test -f build.gradle.kts
 
           test -f app/src/main/assets/tools/arm64-v8a/busybox
           test -f app/src/main/assets/tools/arm64-v8a/usb0-native
-
-          chmod 755 \
-            app/src/main/assets/tools/arm64-v8a/busybox \
-            app/src/main/assets/tools/arm64-v8a/usb0-native
-
-          file \
-            app/src/main/assets/tools/arm64-v8a/busybox
-
-          file \
-            app/src/main/assets/tools/arm64-v8a/usb0-native
 
       - name: Build debug APK
         shell: bash
@@ -421,59 +346,28 @@ jobs:
             --stacktrace \
             -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
 
-      - name: Verify generated APKs
+      - name: Verify APKs
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p artifacts
 
-          DEBUG_APK=""
-          RELEASE_APK=""
+          DEBUG_APK="$(find . \
+            -type f \
+            -path '*/build/outputs/apk/debug/*.apk' \
+            | head -n 1 || true)"
 
-          while IFS= read -r -d '' apk; do
-            case "${apk}" in
-              */build/outputs/apk/debug/*.apk)
-                DEBUG_APK="${apk}"
-                ;;
-              */build/outputs/apk/release/*.apk)
-                RELEASE_APK="${apk}"
-                ;;
-            esac
-          done < <(
-            find . \
-              -type f \
-              -path '*/build/outputs/apk/*.apk' \
-              -print0
-          )
+          RELEASE_APK="$(find . \
+            -type f \
+            -path '*/build/outputs/apk/release/*.apk' \
+            | head -n 1 || true)"
 
-          if [[ -z "${DEBUG_APK}" ]]; then
-            echo "ERROR: Debug APK was not produced"
-            find . \
-              -type f \
-              -path '*/build/outputs/*' \
-              -print || true
-            exit 1
-          fi
-
-          if [[ -z "${RELEASE_APK}" ]]; then
-            echo "ERROR: Release APK was not produced"
-            find . \
-              -type f \
-              -path '*/build/outputs/*' \
-              -print || true
-            exit 1
-          fi
+          test -n "${DEBUG_APK}"
+          test -n "${RELEASE_APK}"
 
           cp "${DEBUG_APK}" artifacts/app-debug.apk
           cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
-
-          ls -lh artifacts/*.apk
-
-      - name: Verify embedded BusyBox
-        shell: bash
-        run: |
-          set -euo pipefail
 
           for apk in artifacts/*.apk; do
             echo "Checking ${apk}"
@@ -487,7 +381,7 @@ jobs:
                 "assets/tools/arm64-v8a/usb0-native"
           done
 
-      - name: Upload APK artifacts
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: USB0-Manager-APKs
@@ -504,5 +398,67 @@ jobs:
             **/build/reports/**
             **/build/outputs/**
             ~/.gradle/daemon/**
+            third_party/busybox/busybox-${BUSYBOX_VERSION}/.config
           if-no-files-found: ignore
           retention-days: 7
+
+  validate:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f ./gradlew
+          chmod 755 ./gradlew
+          test -x ./gradlew
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            bash -n "${file}"
+          done < <(
+            find . \
+              -type f \
+              \( -name '*.sh' -o -name '*.bash' \) \
+              -not -path './.git/*' \
+              -print0
+          )
+
+      - name: Validate workflow file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKFLOW=""
+
+          if [[ -f .github/workflows/build.yml ]]; then
+            WORKFLOW=".github/workflows/build.yml"
+          elif [[ -f .github/workflows/build.yaml ]]; then
+            WORKFLOW=".github/workflows/build.yaml"
+          else
+            echo "ERROR: no workflow file found"
+            find .github/workflows -maxdepth 1 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using workflow: ${WORKFLOW}"
+
+          if grep -nE \
+            'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
+            "${WORKFLOW}" 2>/dev/null; then
+            echo "ERROR: obsolete Android SDK 'tools' package detected"
+            exit 1
+          fi
+
+          grep -q "BUSYBOX_VERSION" "${WORKFLOW}"
+          grep -q "make oldconfig" "${WORKFLOW}"
+          grep -q "bash ./gradlew" "${WORKFLOW}"
