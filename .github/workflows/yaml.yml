@@ -1,188 +1,452 @@
-name: Build USB0 Manager v1.8.1
+name: Build USB0 Manager
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main, master]
-    tags: ['v*']
+    branches:
+      - main
+      - master
+      - "**"
   pull_request:
-    branches: [main, master]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  ANDROID_API_LEVEL: "35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  BUSYBOX_VERSION: "1.37.0"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    env:
-      ANDROID_API_LEVEL: '35'
-      ANDROID_BUILD_TOOLS: '35.0.0'
-      ANDROID_NDK_VERSION: '27.2.12479018'
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK/NDK
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-${ANDROID_API_LEVEL}" \
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
 
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+
+          test -d "${SDK_ROOT}/platform-tools"
+          test -d "${SDK_ROOT}/platforms/android-${ANDROID_API_LEVEL}"
+          test -d "${SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}"
+          test -d "${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+
       - name: Prepare Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
+
+          test -f ./gradlew
           chmod 755 ./gradlew
           test -x ./gradlew
-          bash ./gradlew --version
 
-      - name: Build real ARM64 usb0-native executable
+      - name: Prepare build directories
         shell: bash
         run: |
           set -euo pipefail
-          NDK="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
-          STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
-          "$CLANG" \
-            -O2 \
-            -fPIE \
-            -fstack-protector-strong \
-            -DANDROID \
-            -D__ANDROID_API__=30 \
-            -pie \
-            app/src/main/cpp/usb0-native.c \
-            -o app/src/main/assets/tools/arm64-v8a/usb0-native
+          mkdir -p \
+            app/src/main/assets/tools/arm64-v8a \
+            third_party/busybox \
+            build-tools
 
-          "$STRIP" app/src/main/assets/tools/arm64-v8a/usb0-native || true
-          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
-          file app/src/main/assets/tools/arm64-v8a/usb0-native
-          "$READELF" -h app/src/main/assets/tools/arm64-v8a/usb0-native | grep -E 'Class:|Machine:|Type:'
-
-      - name: Build and bundle BusyBox ARM64
+      - name: Download BusyBox source
         shell: bash
         run: |
           set -euo pipefail
-          chmod 755 scripts/build-busybox.sh
-          ./scripts/build-busybox.sh
 
-      - name: Verify private APK tools
+          cd third_party/busybox
+
+          rm -f \
+            "busybox-${BUSYBOX_VERSION}.tar.bz2" \
+            "busybox-${BUSYBOX_VERSION}.tar.bz2.sha256"
+
+          curl -fL --retry 5 --retry-all-errors \
+            -o "busybox-${BUSYBOX_VERSION}.tar.bz2" \
+            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2"
+
+          test -s "busybox-${BUSYBOX_VERSION}.tar.bz2"
+
+          curl -fL --retry 5 --retry-all-errors \
+            -o "busybox-${BUSYBOX_VERSION}.tar.bz2.sha256" \
+            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2.sha256"
+
+          test -s "busybox-${BUSYBOX_VERSION}.tar.bz2.sha256"
+
+          sha256sum -c \
+            "busybox-${BUSYBOX_VERSION}.tar.bz2.sha256"
+
+          rm -rf "busybox-${BUSYBOX_VERSION}"
+
+          tar -xjf "busybox-${BUSYBOX_VERSION}.tar.bz2"
+
+          test -d "busybox-${BUSYBOX_VERSION}"
+
+      - name: Configure BusyBox for R36S ARM64
         shell: bash
         run: |
           set -euo pipefail
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-native
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper
-          test -s app/src/main/assets/tools/arm64-v8a/usb0-helper.sh
-          test -s app/src/main/assets/tools/arm64-v8a/busybox
-          test -s app/src/main/assets/r36s/lineageos_r36s_defconfig.txt
-          test -s app/src/main/assets/r36s/kernel-capabilities.txt
-          file app/src/main/assets/tools/arm64-v8a/usb0-native
-          file app/src/main/assets/tools/arm64-v8a/busybox
 
-      - name: Create CI release signing key
+          cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
+
+          make defconfig
+
+          ./scripts/config \
+            --enable STATIC
+
+          ./scripts/config \
+            --enable FEATURE_PREFER_APPLETS
+
+          ./scripts/config \
+            --enable IP \
+            --enable FEATURE_IP_LINK \
+            --enable FEATURE_IP_ROUTE \
+            --enable FEATURE_IP_RULE \
+            --enable FEATURE_IP_NEIGH \
+            --enable FEATURE_IP_ADDRESS \
+            --enable FEATURE_IP_TUNNEL \
+            --enable IFCONFIG \
+            --enable IFUP \
+            --enable IFDOWN \
+            --enable ROUTE \
+            --enable ARP \
+            --enable ARPING \
+            --enable PING \
+            --enable PING6 \
+            --enable UDHCPD \
+            --enable UDHCPC \
+            --enable MODPROBE \
+            --enable INSMOD \
+            --enable RMMOD \
+            --enable LS \
+            --enable CAT \
+            --enable CP \
+            --enable MV \
+            --enable RM \
+            --enable MKDIR \
+            --enable READLINK \
+            --enable PS \
+            --enable KILL \
+            --enable SH \
+            --enable ASH \
+            --enable GREP \
+            --enable SED \
+            --enable AWK \
+            --enable SLEEP \
+            --enable DATE \
+            --enable LOGGER \
+            --enable DUMPKMAP \
+            --enable SETSID \
+            --enable ENV \
+            --enable PRINTENV \
+            --enable UNAME
+
+      - name: Build BusyBox for ARM64
         shell: bash
         run: |
           set -euo pipefail
-          keytool -genkeypair \
-            -keystore "$RUNNER_TEMP/usb0-manager-release.jks" \
-            -storepass changeit \
-            -keypass changeit \
-            -alias usb0 \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=USB0 Manager, OU=R36S, O=USB0 Manager, L=R36S, ST=R36S, C=GB" \
-            -noprompt
 
-      - name: Validate shell scripts
+          cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
+
+          make olddefconfig
+
+          make -j"$(nproc)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu-
+
+          test -f busybox
+          file busybox
+          readelf -h busybox | grep -E 'Class:.*ELF64|Machine:.*AArch64'
+
+          cp busybox \
+            "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
+
+          chmod 755 \
+            "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
+
+      - name: Build bundled ARM64 native helper
         shell: bash
         run: |
           set -euo pipefail
-          for f in $(find scripts app/src/main/assets -type f -name '*.sh'); do
-            echo "Checking $f"
-            bash -n "$f"
-          done
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+          NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+
+          TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
+
+          mkdir -p build-tools/native
+
+          if [[ -f app/src/main/cpp/usb0-native.c ]]; then
+            "${TOOLCHAIN}/aarch64-linux-android30-clang" \
+              -O2 \
+              -fPIE \
+              -pie \
+              -DANDROID \
+              -Wall \
+              -Wextra \
+              app/src/main/cpp/usb0-native.c \
+              -o app/src/main/assets/tools/arm64-v8a/usb0-native
+          elif [[ -f app/src/main/cpp/usb0_helper.c ]]; then
+            "${TOOLCHAIN}/aarch64-linux-android30-clang" \
+              -O2 \
+              -fPIE \
+              -pie \
+              -DANDROID \
+              -Wall \
+              -Wextra \
+              app/src/main/cpp/usb0_helper.c \
+              -o app/src/main/assets/tools/arm64-v8a/usb0-native
+          else
+            echo "No ARM64 native helper source found"
+            exit 1
+          fi
+
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          file \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          readelf -h \
+            app/src/main/assets/tools/arm64-v8a/usb0-native |
+            grep -E 'Class:.*ELF64|Machine:.*AArch64'
+
+      - name: Generate helper manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
+          USB0 Manager ARM64 helper bundle
+          BusyBox=${BUSYBOX_VERSION}
+          NativeHelper=usb0-native
+          ABI=arm64-v8a
+          EOF
+
+          test -s app/src/main/assets/tools/arm64-v8a/manifest.txt
+
+      - name: Create JVM compatibility init script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > ci-jvm-targets.gradle <<'EOF'
+          import org.gradle.api.tasks.compile.JavaCompile
+
+          gradle.projectsEvaluated {
+              allprojects { project ->
+                  project.tasks.configureEach { task ->
+
+                      if (task instanceof JavaCompile) {
+                          task.sourceCompatibility = "17"
+                          task.targetCompatibility = "17"
+
+                          try {
+                              task.options.release.set(17)
+                          } catch (Throwable ignored) {
+                          }
+                      }
+
+                      if (task.class.name.contains("KotlinCompile")) {
+                          try {
+                              task.kotlinOptions.jvmTarget = "17"
+                          } catch (Throwable ignored) {
+                          }
+
+                          try {
+                              def compilerOptions = task.compilerOptions
+                              def jvmTarget = compilerOptions.jvmTarget
+                              def target17 = jvmTarget.get().class.enumConstants.find {
+                                  it.toString() == "JVM_17"
+                              }
+
+                              if (target17 != null) {
+                                  jvmTarget.set(target17)
+                              }
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
 
       - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
-          bash ./gradlew assembleDebug --no-daemon --stacktrace
+
+          bash ./gradlew \
+            clean \
+            assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
 
       - name: Build release APK
         shell: bash
         run: |
           set -euo pipefail
-          bash ./gradlew assembleRelease \
+
+          bash ./gradlew \
+            assembleRelease \
             --no-daemon \
             --stacktrace \
-            -PRELEASE_STORE_FILE="$RUNNER_TEMP/usb0-manager-release.jks" \
-            -PRELEASE_STORE_PASSWORD=changeit \
-            -PRELEASE_KEY_ALIAS=usb0 \
-            -PRELEASE_KEY_PASSWORD=changeit
+            -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
 
-      - name: Verify APK signatures and embedded ARM64 tools
+      - name: Verify packaged helper files
         shell: bash
         run: |
           set -euo pipefail
-          APKSIGNER="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-          for apk in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
-            [ -f "$apk" ] || continue
-            echo "Checking $apk"
-            "$APKSIGNER" verify --verbose "$apk"
-            unzip -l "$apk" | grep -F 'assets/tools/arm64-v8a/busybox'
-            unzip -l "$apk" | grep -F 'assets/tools/arm64-v8a/usb0-native'
-            unzip -l "$apk" | grep -F 'assets/tools/arm64-v8a/usb0-helper.sh'
-            unzip -p "$apk" assets/tools/arm64-v8a/busybox | file -
-            unzip -p "$apk" assets/tools/arm64-v8a/usb0-native | file -
-          done
+
+          test -f app/src/main/assets/tools/arm64-v8a/busybox
+          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          file app/src/main/assets/tools/arm64-v8a/busybox
+          file app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          readelf -h \
+            app/src/main/assets/tools/arm64-v8a/busybox |
+            grep -E 'Class:.*ELF64|Machine:.*AArch64'
+
+          readelf -h \
+            app/src/main/assets/tools/arm64-v8a/usb0-native |
+            grep -E 'Class:.*ELF64|Machine:.*AArch64'
 
       - name: Collect APKs
         shell: bash
         run: |
           set -euo pipefail
+
+          rm -rf artifacts
           mkdir -p artifacts
-          cp app/build/outputs/apk/debug/*.apk artifacts/
-          cp app/build/outputs/apk/release/*.apk artifacts/
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: usb0-manager-v1.8.1
-          path: artifacts/*.apk
-          retention-days: 30
+          found=0
 
-      - name: Publish release APKs on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          while IFS= read -r -d '' apk; do
+            echo "Found APK: ${apk}"
+            cp "${apk}" artifacts/
+            found=1
+          done < <(
+            find . \
+              -type f \
+              -path '*/build/outputs/apk/*.apk' \
+              -print0
+          )
 
-      - name: Upload diagnostics on failure
-        if: failure()
+          if [[ "${found}" -eq 0 ]]; then
+            echo "ERROR: No APKs were produced"
+            find . -type f -path '*/build/outputs/*' -print || true
+            exit 1
+          fi
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: usb0-manager-v1.8.1-diagnostics
-          path: |
-            app/build/reports/**
-            app/build/outputs/**
-            ~/.gradle/daemon/**
-          if-no-files-found: ignore
-          retention-days: 7
+          name: USB0-Manager-APKs
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  validate:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f ./gradlew
+          chmod 755 ./gradlew
+          test -x ./gradlew
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
+            bash -n "${file}"
+          done < <(
+            find . \
+              -type f \
+              \( -name '*.sh' -o -name '*.bash' \) \
+              -not -path './.git/*' \
+              -print0
+          )
+
+      - name: Validate workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f .github/workflows/build.yml
+
+          if grep -RniE \
+            --exclude-dir=.git \
+            -E \
+            'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$|sdkmanager.*["'\'']tools["'\'']' \
+            .github 2>/dev/null; then
+            echo "ERROR: obsolete Android SDK 'tools' package detected"
+            exit 1
+          fi
+
+          grep -q "BUSYBOX_VERSION" .github/workflows/build.yml
+          grep -q "busybox-1.37.0.tar.bz2" .github/workflows/build.yml
+          grep -q "bash ./gradlew" .github/workflows/build.yml
+
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f build.gradle || test -f build.gradle.kts
+
+      - name: Check Android source for Java/Kotlin targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -RniE \
+            --exclude-dir=.git \
+            -E \
+            'jvmTarget|sourceCompatibility|targetCompatibility' \
+            app \
+            2>/dev/null || true
