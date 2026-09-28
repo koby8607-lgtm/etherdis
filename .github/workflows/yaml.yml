@@ -53,6 +53,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -78,10 +79,22 @@ jobs:
             -o busybox.tar.bz2
 
           tar -xjf busybox.tar.bz2
-          mv "busybox-${BUSYBOX_VERSION}" busybox-src
+
+          mv \
+            "busybox-${BUSYBOX_VERSION}" \
+            busybox-src
+
           rm -f busybox.tar.bz2
 
-      - name: Apply ARM64 SHA-NI compatibility patch
+      - name: Verify BusyBox source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f busybox-src/libbb/hash_md5_sha.c
+          test -f busybox-src/util-linux/mount.c
+
+      - name: Apply ARM64 SHA1 compatibility patch
         shell: bash
         run: |
           set -euo pipefail
@@ -93,82 +106,52 @@ jobs:
           import sys
 
           path = Path("libbb/hash_md5_sha.c")
-          lines = path.read_text().splitlines()
+          text = path.read_text()
 
-          target = "|| ctx->process_block == sha1_process_block64_shaNI"
+          target = "sha1_process_block64_shaNI"
 
-          matches = [
-              i for i, line in enumerate(lines)
-              if target in line
-          ]
+          if target not in text:
+              print("No SHA-NI reference present; no patch required.")
+              sys.exit(0)
 
-          if not matches:
-              print("ERROR: sha1_process_block64_shaNI reference not found")
-              sys.exit(1)
+          lines = text.splitlines()
 
-          idx = matches[0]
+          for i, line in enumerate(lines):
+              if target not in line:
+                  continue
 
-          # Do not patch twice.
-          before = "\n".join(lines[max(0, idx - 3):idx])
-          after = "\n".join(lines[idx + 1:min(len(lines), idx + 4)])
+              # Already guarded.
+              if i > 0 and "defined(__i386__)" in lines[i - 1]:
+                  print("SHA-NI ARM64 guard already present.")
+                  sys.exit(0)
 
-          if "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))" in before \
-             and "# endif" in after:
-              print("SHA-NI guard already present")
-          else:
-              indent = lines[idx][:len(lines[idx]) - len(lines[idx].lstrip())]
+              if i > 1 and "defined(__i386__)" in lines[i - 2]:
+                  print("SHA-NI ARM64 guard already present.")
+                  sys.exit(0)
+
+              # Insert only a complete nested preprocessor guard around
+              # the x86-only SHA-NI expression.
+              indent = line[:len(line) - len(line.lstrip())]
 
               lines.insert(
-                  idx,
-                  "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))"
+                  i,
+                  f"{indent}#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))"
               )
 
-              # Original target moved one line down.
               lines.insert(
-                  idx + 2,
-                  "# endif"
+                  i + 2,
+                  f"{indent}#endif"
               )
 
               path.write_text("\n".join(lines) + "\n")
-              print("Applied ARM64 SHA-NI guard")
+              print("Applied SHA-NI ARM64 guard.")
+              sys.exit(0)
 
-          # Verify the exact upstream-style structure.
-          text = path.read_text()
-
-          expected = (
-              "#if ENABLE_SHA1_HWACCEL\n"
-              "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
-              "\t || ctx->process_block == sha1_process_block64_shaNI\n"
-              "# endif\n"
-              "#endif"
-          )
-
-          # BusyBox 1.37.0 uses tabs/spaces that can vary slightly.
-          if target not in text:
-              print("ERROR: SHA-NI reference disappeared")
-              sys.exit(1)
-
-          sha_idx = text.index(target)
-
-          surrounding = text[max(0, sha_idx - 180):sha_idx + 180]
-
-          if "# if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))" not in surrounding:
-              print("ERROR: ARM64 SHA-NI guard was not inserted")
-              sys.exit(1)
-
-          if "# endif" not in surrounding:
-              print("ERROR: closing SHA-NI guard was not inserted")
-              sys.exit(1)
-
-          print("SHA-NI patch verification passed")
+          print("ERROR: SHA-NI reference was not patchable.")
+          sys.exit(1)
           PY
 
-          echo "Relevant BusyBox SHA1 section:"
-          grep -n -B5 -A5 \
-            "sha1_process_block64_shaNI" \
-            libbb/hash_md5_sha.c
-
-      - name: Configure BusyBox
+      - name: Disable Android-incompatible BusyBox applets
         shell: bash
         run: |
           set -euo pipefail
@@ -183,18 +166,19 @@ jobs:
           path = Path(".config")
           lines = path.read_text().splitlines()
 
+          # Only enable utilities required by USB0 Manager.
+          # In particular, DO NOT enable mount/umount:
+          # BusyBox mount.c uses addmntent(), which Android Bionic's
+          # mntent.h does not provide.
           wanted = {
+              # Core / shell
               "CONFIG_DESKTOP": "y",
               "CONFIG_LONG_OPTS": "y",
-
-              "CONFIG_FEATURE_SUID": "y",
-              "CONFIG_FEATURE_SUID_CONFIG": "y",
-              "CONFIG_FEATURE_SUID_CONFIG_QUIET": "y",
-
-              "CONFIG_FEATURE_SH_STANDALONE": "y",
               "CONFIG_ASH": "y",
               "CONFIG_ASH_OPTIMIZE_FOR_SIZE": "y",
+              "CONFIG_FEATURE_SH_STANDALONE": "y",
 
+              # Basic shell utilities
               "CONFIG_CAT": "y",
               "CONFIG_CHMOD": "y",
               "CONFIG_CHOWN": "y",
@@ -226,6 +210,7 @@ jobs:
               "CONFIG_USLEEP": "y",
               "CONFIG_WC": "y",
 
+              # Network configuration
               "CONFIG_IP": "y",
               "CONFIG_FEATURE_IP_ADDRESS": "y",
               "CONFIG_FEATURE_IP_LINK": "y",
@@ -245,15 +230,16 @@ jobs:
               "CONFIG_UDHCPC": "y",
               "CONFIG_UDHCPC_DEFAULT_SCRIPT": "y",
 
+              # Root / kernel module helpers
               "CONFIG_MODPROBE": "y",
               "CONFIG_INSMOD": "y",
               "CONFIG_RMMOD": "y",
 
-              "CONFIG_MOUNT": "y",
-              "CONFIG_UMOUNT": "y",
-              "CONFIG_DF": "y",
+              # Diagnostics
               "CONFIG_DMESG": "y",
+              "CONFIG_DF": "y",
 
+              # Android / ARM64 compatibility
               "CONFIG_STATIC": "n",
               "CONFIG_SHA1_HWACCEL": "n",
               "CONFIG_SHA256_HWACCEL": "n",
@@ -263,30 +249,71 @@ jobs:
               "CONFIG_TRACEROUTE": "n",
               "CONFIG_NC": "n",
 
+              # Explicitly disable util-linux functions that are not
+              # required by USB0 Manager and can pull Android-incompatible
+              # libc APIs into the build.
+              "CONFIG_MOUNT": "n",
+              "CONFIG_UMOUNT": "n",
+              "CONFIG_PIVOT_ROOT": "n",
+              "CONFIG_SWAPONOFF": "n",
+              "CONFIG_FREERAMDISK": "n",
+              "CONFIG_LOSETUP": "n",
+              "CONFIG_READAHEAD": "n",
+              "CONFIG_SETSERIAL": "n",
+              "CONFIG_MKFS_EXT2": "n",
+              "CONFIG_MKFS_MINIX": "n",
+              "CONFIG_MKFS_REISER": "n",
+              "CONFIG_FSTRIM": "n",
+              "CONFIG_BLOCKDEV": "n",
+              "CONFIG_RDATE": "n",
+              "CONFIG_EJECT": "n",
+              "CONFIG_IPCRM": "n",
+              "CONFIG_IPCS": "n",
+              "CONFIG_LSPCI": "n",
+              "CONFIG_LSUSB": "n",
+
+              # Avoid optional libc-heavy features.
               "CONFIG_FEATURE_USE_BSS_TAIL": "n",
               "CONFIG_FLOAT_DURATION": "n",
               "CONFIG_FEATURE_RTMINMAX": "n",
               "CONFIG_FEATURE_BUFFERS_GO_ON_STACK": "n",
               "CONFIG_FEATURE_BUFFERS_USE_MALLOC": "n",
               "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
-              "CONFIG_PIVOT_ROOT": "n",
+
+              # Disable optional filesystem / password / archive code.
+              "CONFIG_TAR": "n",
+              "CONFIG_GZIP": "n",
+              "CONFIG_BZIP2": "n",
+              "CONFIG_XZ": "n",
+              "CONFIG_CPIO": "n",
+              "CONFIG_AR": "n",
+              "CONFIG_UNZIP": "n",
+              "CONFIG_CRYPTPW": "n",
+              "CONFIG_LOGIN": "n",
+              "CONFIG_SU": "n",
+              "CONFIG_SULOGIN": "n",
+              "CONFIG_PASSWD": "n",
+              "CONFIG_ADDUSER": "n",
+              "CONFIG_DELUSER": "n",
+              "CONFIG_ADDGROUP": "n",
+              "CONFIG_DELGROUP": "n",
+              "CONFIG_CHGRP": "n",
           }
 
           out = []
           seen = set()
+
+          def emit(key, value):
+              if value == "n":
+                  return f"# {key} is not set"
+              return f"{key}={value}"
 
           for line in lines:
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
 
                   if key in wanted:
-                      value = wanted[key]
-
-                      if value == "n":
-                          out.append(f"# {key} is not set")
-                      else:
-                          out.append(f"{key}={value}")
-
+                      out.append(emit(key, wanted[key]))
                       seen.add(key)
                       continue
 
@@ -294,13 +321,7 @@ jobs:
                   key = line[2:-11]
 
                   if key in wanted:
-                      value = wanted[key]
-
-                      if value == "n":
-                          out.append(f"# {key} is not set")
-                      else:
-                          out.append(f"{key}={value}")
-
+                      out.append(emit(key, wanted[key]))
                       seen.add(key)
                       continue
 
@@ -308,36 +329,61 @@ jobs:
 
           for key, value in wanted.items():
               if key not in seen:
-                  if value == "n":
-                      out.append(f"# {key} is not set")
-                  else:
-                      out.append(f"{key}={value}")
+                  out.append(emit(key, value))
 
           path.write_text("\n".join(out) + "\n")
           PY
 
-          # Kconfig may still have defaulted values that need normalization.
-          # Use a temporary config input containing only blank/default answers.
-          # Capture make's status explicitly so SIGPIPE from an answer producer
-          # cannot make the workflow fail.
+      - name: Normalize BusyBox configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd busybox-src
+
+          rm -f /tmp/busybox-oldconfig.log
+
+          # Feed default answers, but explicitly ignore the producer's
+          # SIGPIPE. We care only about make's return code.
           set +e
-          yes "" | make oldconfig >/tmp/busybox-oldconfig.log 2>&1
-          PIPE_STATUS=("${PIPESTATUS[@]}")
-          MAKE_RC="${PIPE_STATUS[1]}"
+          yes "" | make oldconfig > /tmp/busybox-oldconfig.log 2>&1
+          status=("${PIPESTATUS[@]}")
+          make_rc="${status[1]}"
           set -e
 
           cat /tmp/busybox-oldconfig.log
 
-          if [ "${MAKE_RC}" -ne 0 ]; then
-            echo "BusyBox oldconfig failed with exit code ${MAKE_RC}"
-            exit "${MAKE_RC}"
+          if [ "${make_rc}" -ne 0 ]; then
+            echo "BusyBox Kconfig failed with exit code ${make_rc}"
+            exit "${make_rc}"
           fi
 
-          echo "Final critical BusyBox configuration:"
+          # Verify no accidentally-enabled mount code remains.
+          if grep -Eq '^CONFIG_MOUNT=y$|^CONFIG_UMOUNT=y$|^CONFIG_PIVOT_ROOT=y$' .config; then
+            echo "ERROR: Android-incompatible mount functionality was enabled"
+            grep -E '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT)=' .config || true
+            exit 1
+          fi
+
+          echo "BusyBox configuration accepted."
+
+      - name: Verify BusyBox source does not contain an enabled mount target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd busybox-src
+
+          echo "Enabled relevant configuration:"
           grep -E \
-            '^(CONFIG_STATIC|CONFIG_SHA1_HWACCEL|CONFIG_SHA256_HWACCEL|CONFIG_TC|CONFIG_PIVOT_ROOT|CONFIG_FEATURE_BUFFERS_GO_IN_BSS)=' \
+            '^CONFIG_(MOUNT|UMOUNT|PIVOT_ROOT|IP|IFCONFIG|ARP|ARPING|ROUTE|UDHCPC|MODPROBE|INSMOD|RMMOD|STATIC)=' \
             .config \
             || true
+
+          if grep -Eq '^CONFIG_MOUNT=y$' .config; then
+            echo "ERROR: CONFIG_MOUNT=y is forbidden for Android Bionic build"
+            exit 1
+          fi
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -374,9 +420,8 @@ jobs:
           export LDFLAGS
 
           echo "Compiler: $CC"
-          echo "Archiver: $AR"
-          echo "Ranlib:   $RANLIB"
-          echo "Strip:    $STRIP"
+          echo "Android NDK: ${ANDROID_NDK_ROOT}"
+          echo "BusyBox: ${BUSYBOX_VERSION}"
 
           "$CC" --version
 
@@ -397,12 +442,32 @@ jobs:
           readelf -l busybox \
             | grep -q "Requesting program interpreter"
 
+      - name: Smoke-test BusyBox binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd busybox-src
+
+          # Validate the binary without executing the Android target binary
+          # on the Ubuntu runner.
+          file busybox
+          readelf -h busybox
+          readelf -l busybox
+
+          # Confirm expected applets were compiled.
+          strings busybox | grep -q "udhcpc"
+          strings busybox | grep -q "arping"
+          strings busybox | grep -q "ifconfig"
+          strings busybox | grep -q "route"
+
       - name: Install embedded ARM64 tools
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p app/src/main/assets/tools/arm64-v8a
+          mkdir -p \
+            app/src/main/assets/tools/arm64-v8a
 
           cp \
             busybox-src/busybox \
@@ -420,7 +485,8 @@ jobs:
               app/src/main/cpp/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
           else
-            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
+            cat > \
+              app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "$SELF/busybox" "$@"
@@ -439,6 +505,8 @@ jobs:
           SHA1_HWACCEL=NO
           SHA256_HWACCEL=NO
           TC=NO
+          MOUNT=NO
+          UMOUNT=NO
           PIVOT_ROOT=NO
           EOF
 
@@ -484,15 +552,15 @@ jobs:
           fi
 
           for APK in "${APKS[@]}"; do
-            echo "Checking $APK"
+            echo "Checking ${APK}"
 
-            unzip -l "$APK" \
+            unzip -l "${APK}" \
               | grep -q "assets/tools/arm64-v8a/busybox"
 
-            unzip -l "$APK" \
+            unzip -l "${APK}" \
               | grep -q "assets/tools/arm64-v8a/usb0-native"
 
-            unzip -l "$APK" \
+            unzip -l "${APK}" \
               | grep -q "assets/tools/arm64-v8a/manifest.txt"
           done
 
@@ -533,6 +601,7 @@ jobs:
           import sys
 
           directory = Path(".github/workflows")
+
           workflows = sorted(directory.glob("*.yml"))
           workflows += sorted(directory.glob("*.yaml"))
 
@@ -548,11 +617,15 @@ jobs:
                   "packages: 'tools",
                   'packages: "tools',
                   "android-actions/setup-android@v2",
+                  "CONFIG_MOUNT=y",
+                  "CONFIG_UMOUNT=y",
+                  "CONFIG_PIVOT_ROOT=y",
+                  "yes | make oldconfig",
               )
 
               for item in forbidden:
                   if item in text:
-                      print(f"ERROR: {item!r} found in {workflow}")
+                      print(f"ERROR: forbidden pattern {item!r} found in {workflow}")
                       sys.exit(1)
 
           print("Workflow validation passed")
