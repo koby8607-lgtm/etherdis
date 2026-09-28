@@ -47,7 +47,7 @@ jobs:
             "build-tools;${ANDROID_BUILD_TOOLS}" \
             "ndk;${ANDROID_NDK_VERSION}"
 
-          echo "ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         shell: bash
@@ -67,228 +67,149 @@ jobs:
             unzip \
             zip
 
-      - name: Fix Gradle wrapper permissions
+      - name: Fix Gradle wrapper
         shell: bash
         run: |
           set -euo pipefail
 
           chmod 755 ./gradlew
-
           bash ./gradlew --version
-
-      - name: Remove previous CI Gradle injection
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # The project already defines Java 17 and Kotlin JVM 17 in
-          # app/build.gradle. The previous workflow created an external
-          # android-build-fix.gradle file and applied a KotlinCompile import
-          # before the Kotlin plugin was available, causing:
-          #
-          # unable to resolve class org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-          #
-          # Do not inject that script.
-          rm -f android-build-fix.gradle
-
-          test ! -e android-build-fix.gradle
-
-      - name: Verify project JVM configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FILE="app/build.gradle"
-
-          test -f "${FILE}"
-
-          grep -Eq \
-            "sourceCompatibility[[:space:]]+JavaVersion\.VERSION_17" \
-            "${FILE}"
-
-          grep -Eq \
-            "targetCompatibility[[:space:]]+JavaVersion\.VERSION_17" \
-            "${FILE}"
-
-          grep -Eq \
-            "jvmTarget[[:space:]]*=[[:space:]]*['\"]17['\"]" \
-            "${FILE}"
-
-          echo "Project already targets Java 17 / Kotlin JVM 17."
 
       - name: Fix MonitorService Kotlin source
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="app/src/main/java/com/r36s/usb0manager/MonitorService.kt"
+          file="app/src/main/java/com/r36s/usb0manager/MonitorService.kt"
 
-          test -f "${FILE}"
+          test -f "$file"
 
-          python3 - "${FILE}" <<'PY'
+          python3 - "$file" <<'PY'
           from pathlib import Path
           import sys
 
-          path = Path(sys.argv[1])
-          text = path.read_text()
+          p = Path(sys.argv[1])
+          s = p.read_text()
 
-          bad = (
-              'return out + if (err.isNotBlank()) '
-              '"\\n[stderr]\\n$err" else ""'
-          )
+          bad = 'return out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""'
+          good = 'return@runHelper out + if (err.isNotBlank()) "\\n[stderr]\\n$err" else ""'
 
-          good = (
-              'return@runHelper out + if (err.isNotBlank()) '
-              '"\\n[stderr]\\n$err" else ""'
-          )
+          if good not in s and bad in s:
+              s = s.replace(bad, good, 1)
 
-          if good not in text and bad in text:
-              text = text.replace(bad, good, 1)
-
-          if good not in text:
+          if good not in s:
               marker = "private fun runHelper(command: String): String = try"
 
-              if marker in text:
-                  text = text.replace(
+              if marker in s:
+                  s = s.replace(
                       marker,
                       "private fun runHelper(command: String): String {\n"
                       "        return try",
                       1
                   )
 
-          path.write_text(text)
+          p.write_text(s)
 
-          final = path.read_text()
+          final = p.read_text()
 
-          if "return out + if (err.isNotBlank())" in final:
-              raise SystemExit(
-                  "ERROR: invalid bare return still exists in runHelper()"
-              )
+          if bad in final:
+              raise SystemExit("Bare return still exists in runHelper()")
 
-          if (
-              "private fun runHelper(command: String): String = try"
-              in final
-              and "return@runHelper" not in final
-          ):
-              raise SystemExit(
-                  "ERROR: expression-body runHelper still exists"
-              )
+          if marker in final:
+              raise SystemExit("Expression-body runHelper() still exists")
 
-          print("MonitorService Kotlin source verified.")
+          print("MonitorService Kotlin fix verified.")
           PY
 
-      - name: Prepare embedded tool directory
+      - name: Prepare embedded tools
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p \
-            app/src/main/assets/tools/arm64-v8a
+          mkdir -p app/src/main/assets/tools/arm64-v8a
 
       - name: Build usb0-native
         shell: bash
         run: |
           set -euo pipefail
 
-          NDK="${ANDROID_NDK_ROOT}"
-          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          SOURCE=""
+          toolchain="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          source_file=""
 
           if [ -f app/src/main/cpp/usb0-native.c ]; then
-            SOURCE="app/src/main/cpp/usb0-native.c"
+            source_file="app/src/main/cpp/usb0-native.c"
           elif [ -f app/src/main/cpp/usb0-native.cpp ]; then
-            SOURCE="app/src/main/cpp/usb0-native.cpp"
+            source_file="app/src/main/cpp/usb0-native.cpp"
           fi
 
-          if [ -n "${SOURCE}" ]; then
-            if [[ "${SOURCE}" == *.cpp ]]; then
-              "${TOOLCHAIN}/aarch64-linux-android30-clang++" \
+          if [ -n "$source_file" ]; then
+            if [[ "$source_file" == *.cpp ]]; then
+              "${toolchain}/aarch64-linux-android30-clang++" \
                 -O2 \
                 -fPIE \
                 -fstack-protector-strong \
                 -DANDROID \
                 -pie \
-                "${SOURCE}" \
+                "$source_file" \
                 -o app/src/main/assets/tools/arm64-v8a/usb0-native
             else
-              "${TOOLCHAIN}/aarch64-linux-android30-clang" \
+              "${toolchain}/aarch64-linux-android30-clang" \
                 -O2 \
                 -fPIE \
                 -fstack-protector-strong \
                 -DANDROID \
                 -pie \
-                "${SOURCE}" \
+                "$source_file" \
                 -o app/src/main/assets/tools/arm64-v8a/usb0-native
             fi
 
-            "${TOOLCHAIN}/llvm-strip" \
+            "${toolchain}/llvm-strip" \
               app/src/main/assets/tools/arm64-v8a/usb0-native || true
           else
-            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
+            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'SH'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "$SELF/busybox" "$@"
-          EOF
+          SH
           fi
 
-          chmod 755 \
-            app/src/main/assets/tools/arm64-v8a/usb0-native
+          chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
 
-      - name: Create BusyBox builder
+      - name: Build BusyBox
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p scripts
+          root="$PWD"
+          work="${RUNNER_TEMP}/usb0-busybox"
+          source_dir="${work}/busybox-${BUSYBOX_VERSION}"
+          output_dir="${root}/app/src/main/assets/tools/arm64-v8a"
+          toolchain="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          cat > scripts/build-busybox.sh <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-
-          VERSION="${BUSYBOX_VERSION:-1.37.0}"
-          WORK="${RUNNER_TEMP:-/tmp}/usb0-busybox"
-          SRC="${WORK}/busybox-${VERSION}"
-
-          OUTDIR="${ROOT}/app/src/main/assets/tools/arm64-v8a"
-          OUT="${OUTDIR}/busybox"
-
-          NDK="${ANDROID_NDK_ROOT}"
-          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
-          STRIP="${TOOLCHAIN}/llvm-strip"
-
-          rm -rf "${WORK}"
-          mkdir -p "${WORK}"
-          mkdir -p "${OUTDIR}"
+          rm -rf "$work"
+          mkdir -p "$work" "$output_dir"
 
           curl -fsSL --retry 5 \
-            "https://busybox.net/downloads/busybox-${VERSION}.tar.bz2" \
-            -o "${WORK}/busybox.tar.bz2"
+            "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" \
+            -o "${work}/busybox.tar.bz2"
 
-          tar -xjf "${WORK}/busybox.tar.bz2" -C "${WORK}"
+          tar -xjf "${work}/busybox.tar.bz2" -C "$work"
 
-          test -d "${SRC}"
+          cd "$source_dir"
 
-          cd "${SRC}"
-
-          # ARM64 SHA-NI compatibility.
           python3 - <<'PY'
           from pathlib import Path
 
           p = Path("libbb/hash_md5_sha.c")
-          text = p.read_text()
+          s = p.read_text()
 
-          target = "sha1_process_block64_shaNI"
+          needle = "sha1_process_block64_shaNI"
 
-          if target in text:
-              lines = text.splitlines()
+          if needle in s:
+              lines = s.splitlines()
 
               for i, line in enumerate(lines):
-                  if target not in line:
+                  if needle not in line:
                       continue
 
                   nearby = "\n".join(
@@ -315,22 +236,19 @@ jobs:
                   break
           PY
 
-          # Start from the smallest possible BusyBox.
           make allnoconfig
 
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path(".config")
-          lines = path.read_text().splitlines()
+          p = Path(".config")
+          lines = p.read_text().splitlines()
 
           wanted = {
-              # Shell
               "CONFIG_ASH": "y",
               "CONFIG_ASH_OPTIMIZE_FOR_SIZE": "y",
               "CONFIG_FEATURE_SH_STANDALONE": "y",
 
-              # Basic tools
               "CONFIG_CAT": "y",
               "CONFIG_CHMOD": "y",
               "CONFIG_CP": "y",
@@ -358,7 +276,6 @@ jobs:
               "CONFIG_UNAME": "y",
               "CONFIG_WC": "y",
 
-              # USB0 network tools
               "CONFIG_IP": "y",
               "CONFIG_FEATURE_IP_ADDRESS": "y",
               "CONFIG_FEATURE_IP_LINK": "y",
@@ -367,32 +284,33 @@ jobs:
               "CONFIG_FEATURE_IP_NEIGH": "y",
               "CONFIG_FEATURE_IP_TUNNEL": "y",
               "CONFIG_FEATURE_IP_SHORT_FORMS": "y",
+
               "CONFIG_ARP": "y",
               "CONFIG_UDHCPC": "y",
               "CONFIG_UDHCPC_DEFAULT_SCRIPT": "y",
               "CONFIG_PING": "y",
 
-              # Kernel modules
               "CONFIG_MODPROBE": "y",
               "CONFIG_INSMOD": "y",
               "CONFIG_RMMOD": "y",
 
-              # Diagnostics
               "CONFIG_DMESG": "y",
 
-              # Dynamic Android/Bionic
               "CONFIG_STATIC": "n",
-
-              # Disable problematic optional features
               "CONFIG_SHA1_HWACCEL": "n",
               "CONFIG_SHA256_HWACCEL": "n",
+
+              "CONFIG_IFCONFIG": "n",
+              "CONFIG_ROUTE": "n",
+              "CONFIG_ARPING": "n",
+              "CONFIG_PING6": "n",
+
               "CONFIG_TC": "n",
               "CONFIG_HOSTID": "n",
               "CONFIG_NETSTAT": "n",
               "CONFIG_TRACEROUTE": "n",
               "CONFIG_NC": "n",
 
-              # Do not compile Android-incompatible util-linux mount code.
               "CONFIG_MOUNT": "n",
               "CONFIG_UMOUNT": "n",
               "CONFIG_PIVOT_ROOT": "n",
@@ -404,13 +322,6 @@ jobs:
               "CONFIG_BLOCKDEV": "n",
               "CONFIG_EJECT": "n",
 
-              # These caused previous networking/interface failures.
-              "CONFIG_IFCONFIG": "n",
-              "CONFIG_ROUTE": "n",
-              "CONFIG_ARPING": "n",
-              "CONFIG_PING6": "n",
-
-              # Unneeded archive/filesystem functions.
               "CONFIG_TAR": "n",
               "CONFIG_GZIP": "n",
               "CONFIG_BZIP2": "n",
@@ -419,7 +330,6 @@ jobs:
               "CONFIG_AR": "n",
               "CONFIG_UNZIP": "n",
 
-              # Other optional features.
               "CONFIG_FEATURE_USE_BSS_TAIL": "n",
               "CONFIG_FLOAT_DURATION": "n",
               "CONFIG_FEATURE_RTMINMAX": "n",
@@ -428,61 +338,48 @@ jobs:
               "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
           }
 
-          def emit(key, value):
-              if value == "n":
-                  return f"# {key} is not set"
-              return f"{key}={value}"
+          def emit(k, v):
+              if v == "n":
+                  return f"# {k} is not set"
+              return f"{k}={v}"
 
-          result = []
+          output = []
           seen = set()
 
           for line in lines:
+              key = None
+
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
-
-                  if key in wanted:
-                      result.append(emit(key, wanted[key]))
-                      seen.add(key)
-                      continue
-
-              if (
-                  line.startswith("# CONFIG_")
-                  and line.endswith(" is not set")
-              ):
+              elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
                   key = line[2:-11]
 
-                  if key in wanted:
-                      result.append(emit(key, wanted[key]))
-                      seen.add(key)
-                      continue
-
-              result.append(line)
+              if key in wanted:
+                  output.append(emit(key, wanted[key]))
+                  seen.add(key)
+              else:
+                  output.append(line)
 
           for key, value in wanted.items():
               if key not in seen:
-                  result.append(emit(key, value))
+                  output.append(emit(key, value))
 
-          path.write_text("\n".join(result) + "\n")
+          p.write_text("\n".join(output) + "\n")
           PY
 
-          # Resolve remaining Kconfig dependencies.
           set +e
-
-          yes "" | make oldconfig > "${WORK}/oldconfig.log" 2>&1
-
-          pipe_status=("${PIPESTATUS[@]}")
-          make_rc="${pipe_status[1]}"
-
+          yes "" | make oldconfig > "${work}/oldconfig.log" 2>&1
+          statuses=("${PIPESTATUS[@]}")
+          make_rc="${statuses[1]}"
           set -e
 
-          cat "${WORK}/oldconfig.log"
+          cat "${work}/oldconfig.log"
 
-          if [ "${make_rc}" -ne 0 ]; then
-              echo "BusyBox oldconfig failed: ${make_rc}"
-              exit "${make_rc}"
+          if [ "$make_rc" -ne 0 ]; then
+            echo "BusyBox oldconfig failed with exit code $make_rc"
+            exit "$make_rc"
           fi
 
-          # Hard checks before compiling.
           for symbol in \
               CONFIG_IFCONFIG \
               CONFIG_ROUTE \
@@ -492,10 +389,10 @@ jobs:
               CONFIG_UMOUNT \
               CONFIG_PIVOT_ROOT; do
 
-              if grep -Eq "^${symbol}=y$" .config; then
-                  echo "ERROR: forbidden ${symbol}=y"
-                  exit 1
-              fi
+            if grep -Eq "^${symbol}=y$" .config; then
+              echo "Forbidden ${symbol}=y"
+              exit 1
+            fi
           done
 
           for symbol in \
@@ -504,123 +401,89 @@ jobs:
               CONFIG_UDHCPC \
               CONFIG_PING; do
 
-              if ! grep -Eq "^${symbol}=y$" .config; then
-                  echo "ERROR: required ${symbol}=y missing"
-                  exit 1
-              fi
+            if ! grep -Eq "^${symbol}=y$" .config; then
+              echo "Missing required ${symbol}=y"
+              exit 1
+            fi
           done
 
-          # IMPORTANT:
-          # Do not add -D__ANDROID_API__=30.
-          # The Android target compiler already defines this macro.
-          export CC="${CC}"
+          export CC="${toolchain}/aarch64-linux-android30-clang"
           export HOSTCC="cc"
           export AR="$(command -v ar)"
           export RANLIB="$(command -v ranlib)"
-          export STRIP="${STRIP}"
+          export STRIP="${toolchain}/llvm-strip"
 
+          # Do not define __ANDROID_API__ manually.
+          # The Android target compiler already supplies it.
           export CFLAGS="-Os -fPIE"
           export LDFLAGS="-pie"
 
           make V=1 -j1 \
-              CC="${CC}" \
-              HOSTCC="${HOSTCC}" \
-              AR="${AR}" \
-              RANLIB="${RANLIB}" \
-              STRIP="${STRIP}" \
-              CFLAGS="${CFLAGS}" \
-              LDFLAGS="${LDFLAGS}"
+            CC="${CC}" \
+            HOSTCC="${HOSTCC}" \
+            AR="${AR}" \
+            RANLIB="${RANLIB}" \
+            STRIP="${STRIP}" \
+            CFLAGS="${CFLAGS}" \
+            LDFLAGS="${LDFLAGS}"
 
           test -f busybox
           test -f include/autoconf.h
 
-          # Never execute the AArch64 binary on the x86_64 runner.
-          for symbol in \
-              IP \
-              ARP \
-              UDHCPC \
-              PING; do
-
-              grep -Eq \
-                  "^#define ENABLE_${symbol} 1$" \
-                  include/autoconf.h || {
-
-                  echo "ERROR: BusyBox applet ${symbol} was not compiled"
-                  exit 1
-              }
+          # Never execute the AArch64 target binary on the x86_64 GitHub runner.
+          for symbol in IP ARP UDHCPC PING; do
+            grep -Eq "^#define ENABLE_${symbol} 1$" include/autoconf.h || {
+              echo "Missing BusyBox applet ${symbol}"
+              exit 1
+            }
           done
 
-          for symbol in \
-              IFCONFIG \
-              ROUTE \
-              ARPING \
-              PING6; do
-
-              if grep -Eq \
-                  "^#define ENABLE_${symbol} 1$" \
-                  include/autoconf.h; then
-
-                  echo "ERROR: forbidden applet ${symbol} was compiled"
-                  exit 1
-              fi
+          for symbol in IFCONFIG ROUTE ARPING PING6; do
+            if grep -Eq "^#define ENABLE_${symbol} 1$" include/autoconf.h; then
+              echo "Forbidden BusyBox applet ${symbol} was compiled"
+              exit 1
+            fi
           done
 
-          mkdir -p "${OUTDIR}"
+          cp busybox "${output_dir}/busybox"
+          chmod 755 "${output_dir}/busybox"
+          "${STRIP}" "${output_dir}/busybox" || true
 
-          cp busybox "${OUT}"
-          chmod 755 "${OUT}"
+          file "${output_dir}/busybox"
 
-          "${STRIP}" "${OUT}" || true
+          "${toolchain}/llvm-readelf" -h "${output_dir}/busybox" \
+            | grep -Eq "Class:.*ELF64"
 
-          file "${OUT}"
+          "${toolchain}/llvm-readelf" -h "${output_dir}/busybox" \
+            | grep -Eq "Machine:.*AArch64"
 
-          "${TOOLCHAIN}/llvm-readelf" -h "${OUT}" \
-              | grep -Eq "Class:.*ELF64"
+          "${toolchain}/llvm-readelf" -l "${output_dir}/busybox" \
+            | grep -q "Requesting program interpreter"
 
-          "${TOOLCHAIN}/llvm-readelf" -h "${OUT}" \
-              | grep -Eq "Machine:.*AArch64"
-
-          "${TOOLCHAIN}/llvm-readelf" -l "${OUT}" \
-              | grep -q "Requesting program interpreter"
-
-          echo "BusyBox ARM64 build verified."
-          SCRIPT
-
-          chmod 755 scripts/build-busybox.sh
-
-          bash -n scripts/build-busybox.sh
-
-      - name: Build BusyBox
+      - name: Install helper files
         shell: bash
         run: |
           set -euo pipefail
 
-          bash ./scripts/build-busybox.sh
+          dir="app/src/main/assets/tools/arm64-v8a"
 
-      - name: Install helper scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          DIR="app/src/main/assets/tools/arm64-v8a"
-
-          cat > "${DIR}/usb0-helper.sh" <<'EOF'
+          cat > "${dir}/usb0-helper.sh" <<'SH'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "${SELF}/busybox" "$@"
-          EOF
+          SH
 
-          cat > "${DIR}/usb0-helper" <<'EOF'
+          cat > "${dir}/usb0-helper" <<'SH'
           #!/system/bin/sh
           SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
           exec "${SELF}/busybox" "$@"
-          EOF
+          SH
 
           chmod 755 \
-              "${DIR}/usb0-helper.sh" \
-              "${DIR}/usb0-helper"
+            "${dir}/usb0-helper.sh" \
+            "${dir}/usb0-helper"
 
-          cat > "${DIR}/manifest.txt" <<EOF
+          cat > "${dir}/manifest.txt" <<EOF
           ARCH=arm64-v8a
           ANDROID_API=${ANDROID_API_LEVEL}
           BUSYBOX_VERSION=${BUSYBOX_VERSION}
@@ -639,20 +502,20 @@ jobs:
           TARGET_BINARY_MUST_NOT_RUN_ON_CI=YES
           EOF
 
-      - name: Verify embedded tools
+      - name: Verify embedded files
         shell: bash
         run: |
           set -euo pipefail
 
-          DIR="app/src/main/assets/tools/arm64-v8a"
+          dir="app/src/main/assets/tools/arm64-v8a"
 
-          test -s "${DIR}/busybox"
-          test -s "${DIR}/usb0-native"
-          test -s "${DIR}/usb0-helper"
-          test -s "${DIR}/usb0-helper.sh"
-          test -s "${DIR}/manifest.txt"
+          test -s "${dir}/busybox"
+          test -s "${dir}/usb0-native"
+          test -s "${dir}/usb0-helper"
+          test -s "${dir}/usb0-helper.sh"
+          test -s "${dir}/manifest.txt"
 
-          file "${DIR}/busybox"
+          file "${dir}/busybox"
 
       - name: Build debug APK
         shell: bash
@@ -661,17 +524,11 @@ jobs:
 
           chmod 755 ./gradlew
 
-          # The project itself already has:
-          # Java sourceCompatibility 17
-          # Java targetCompatibility 17
-          # Kotlin jvmTarget 17
-          #
-          # Therefore no external Kotlin Gradle class/import is needed.
           bash ./gradlew \
-              clean \
-              assembleDebug \
-              --no-daemon \
-              --stacktrace
+            clean \
+            assembleDebug \
+            --no-daemon \
+            --stacktrace
 
       - name: Build release APK
         shell: bash
@@ -681,60 +538,56 @@ jobs:
           chmod 755 ./gradlew
 
           bash ./gradlew \
-              assembleRelease \
-              --no-daemon \
-              --stacktrace
+            assembleRelease \
+            --no-daemon \
+            --stacktrace
 
       - name: Verify APK contents
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t APKS < <(
-              find app/build/outputs \
-                -type f \
-                -name "*.apk" \
-                | sort
+          mapfile -t apks < <(
+            find app/build/outputs \
+              -type f \
+              -name "*.apk" \
+              | sort
           )
 
-          if [ "${#APKS[@]}" -eq 0 ]; then
-              echo "ERROR: no APK produced"
-              exit 1
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "ERROR: no APK produced"
+            exit 1
           fi
 
-          for apk in "${APKS[@]}"; do
-              echo "Checking ${apk}"
+          for apk in "${apks[@]}"; do
+            echo "Checking ${apk}"
 
-              unzip -l "${apk}" \
-                  | grep -q \
-                    "assets/tools/arm64-v8a/busybox"
+            unzip -l "${apk}" \
+              | grep -q \
+                "assets/tools/arm64-v8a/busybox"
 
-              unzip -l "${apk}" \
-                  | grep -q \
-                    "assets/tools/arm64-v8a/usb0-native"
+            unzip -l "${apk}" \
+              | grep -q \
+                "assets/tools/arm64-v8a/usb0-native"
 
-              unzip -l "${apk}" \
-                  | grep -q \
-                    "assets/tools/arm64-v8a/usb0-helper"
+            unzip -l "${apk}" \
+              | grep -q \
+                "assets/tools/arm64-v8a/usb0-helper.sh"
 
-              unzip -l "${apk}" \
-                  | grep -q \
-                    "assets/tools/arm64-v8a/usb0-helper.sh"
+            unzip -l "${apk}" \
+              | grep -q \
+                "assets/tools/arm64-v8a/manifest.txt"
 
-              unzip -l "${apk}" \
-                  | grep -q \
-                    "assets/tools/arm64-v8a/manifest.txt"
-
-              echo "Verified ${apk}"
+            echo "Verified ${apk}"
           done
 
-      - name: Upload APK
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: USB0-Manager-APK
           path: |
-              app/build/outputs/apk/debug/*.apk
-              app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -743,62 +596,52 @@ jobs:
         with:
           name: USB0-Manager-BusyBox-ARM64
           path: |
-              app/src/main/assets/tools/arm64-v8a/busybox
-              app/src/main/assets/tools/arm64-v8a/manifest.txt
+            app/src/main/assets/tools/arm64-v8a/busybox
+            app/src/main/assets/tools/arm64-v8a/manifest.txt
           if-no-files-found: error
           retention-days: 30
 
-      # This job demonstrates job-to-job communication through artifacts.
-      # Files created by "build" are not automatically available to another
-      # GitHub Actions job, so future jobs should use upload/download artifacts.
-      verify:
-        name: Verify build outputs
-        runs-on: ubuntu-24.04
-        needs: build
-
-        steps:
-          - name: Download APK artifact
-            uses: actions/download-artifact@v4
-            with:
-              name: USB0-Manager-APK
-              path: verified-apks
-
-          - name: Verify downloaded APK artifact
-            shell: bash
-            run: |
-              set -euo pipefail
-
-              mapfile -t APKS < <(
-                  find verified-apks \
-                    -type f \
-                    -name "*.apk" \
-                    | sort
-              )
-
-              if [ "${#APKS[@]}" -eq 0 ]; then
-                  echo "ERROR: no APK was passed from build job"
-                  exit 1
-              fi
-
-              for apk in "${APKS[@]}"; do
-                  echo "Final artifact received:"
-                  echo "${apk}"
-                  file "${apk}"
-              done
-
-              echo "Build job -> verify job communication succeeded."
-
-  validate-workflow:
-    name: Validate workflow
+  verify:
     runs-on: ubuntu-24.04
     needs: build
-    if: always()
+
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: USB0-Manager-APK
+          path: verified-apks
+
+      - name: Verify build job output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t apks < <(
+            find verified-apks \
+              -type f \
+              -name "*.apk" \
+              | sort
+          )
+
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "ERROR: no APK received from build job"
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            echo "Received: ${apk}"
+            file "${apk}"
+          done
+
+  validate:
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate all workflow files
+      - name: Validate workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -806,10 +649,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          directory = Path(".github/workflows")
-
-          files = sorted(directory.glob("*.yml"))
-          files += sorted(directory.glob("*.yaml"))
+          files = sorted(Path(".github/workflows").glob("*.yml"))
+          files += sorted(Path(".github/workflows").glob("*.yaml"))
 
           if not files:
               raise SystemExit("No workflow files found")
@@ -826,16 +667,16 @@ jobs:
               "CONFIG_PIVOT_ROOT=y",
           )
 
-          for workflow in files:
-              text = workflow.read_text()
+          for path in files:
+              text = path.read_text()
 
               for pattern in forbidden:
                   if pattern in text:
                       raise SystemExit(
-                          f"Forbidden pattern {pattern!r} found in {workflow}"
+                          f"Forbidden pattern {pattern!r} found in {path}"
                       )
 
-              print(f"Validated {workflow}")
+              print(f"Validated {path}")
 
           print("All workflow files passed validation.")
           PY
