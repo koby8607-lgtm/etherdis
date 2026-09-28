@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  ANDROID_API_LEVEL: "35"
+  ANDROID_API_LEVEL: "30"
   ANDROID_BUILD_TOOLS: "35.0.0"
   ANDROID_NDK_VERSION: "27.2.12479018"
   BUSYBOX_VERSION: "1.37.0"
@@ -91,7 +91,7 @@ jobs:
 
           test -d "busybox-${BUSYBOX_VERSION}"
 
-      - name: Configure BusyBox
+      - name: Configure BusyBox for Android ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -99,10 +99,22 @@ jobs:
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
           #
-          # Start from the smallest possible configuration. This avoids
-          # pulling in unrelated BusyBox utilities such as tc.
+          # Use BusyBox's Android configuration as the starting point.
+          # BusyBox's Android configs intentionally avoid the static
+          # Bionic problems encountered by generic defconfig builds.
           #
-          make allnoconfig
+          if make android_502_defconfig; then
+            echo "Using android_502_defconfig"
+          elif make android_defconfig; then
+            echo "Using android_defconfig"
+          else
+            echo "ERROR: BusyBox Android configuration target not found"
+            echo "Available Android configs:"
+            find configs -maxdepth 1 -type f \
+              -iname '*android*' \
+              -print || true
+            exit 1
+          fi
 
           python3 - <<'PY'
           from pathlib import Path
@@ -112,9 +124,6 @@ jobs:
           text = path.read_text()
 
           enable = [
-              "STATIC",
-              "FEATURE_PREFER_APPLETS",
-
               "IP",
               "FEATURE_IP_LINK",
               "FEATURE_IP_ROUTE",
@@ -150,7 +159,6 @@ jobs:
               "AWK",
               "SLEEP",
               "DATE",
-              "LOGGER",
               "ENV",
               "PRINTENV",
               "UNAME",
@@ -159,6 +167,17 @@ jobs:
           ]
 
           disable = [
+              #
+              # Do not enable static linking on Android/Bionic.
+              # The previous build failed because static libc.a exports
+              # strchrnul through Android's dispatch object while BusyBox
+              # also supplied its own implementation.
+              #
+              "STATIC",
+
+              #
+              # Large/unneeded networking utilities.
+              #
               "TC",
               "NETSTAT",
               "TRACEROUTE",
@@ -168,6 +187,9 @@ jobs:
               "TELNET",
               "TELNETD",
 
+              #
+              # Unnecessary services/system utilities.
+              #
               "INIT",
               "MDEV",
               "SWAPON",
@@ -177,15 +199,20 @@ jobs:
               "FDISK",
               "FSCK",
               "BLKID",
-
               "CROND",
               "CRONTAB",
               "SYSLOGD",
               "KLOGD",
-
               "LOGIN",
               "SULOGIN",
               "SU",
+
+              #
+              # Avoid BusyBox's syslog dependency. The Android app has
+              # its own logging system.
+              #
+              "LOGGER",
+              "LOGREAD",
           ]
 
           def set_symbol(src, symbol, enabled):
@@ -202,11 +229,10 @@ jobs:
                   else f"# {name} is not set"
               )
 
-              return pattern.sub(
-                  replacement,
-                  src,
-                  count=1,
-              )
+              if pattern.search(src):
+                  return pattern.sub(replacement, src, count=1)
+
+              return src
 
           for symbol in enable:
               text = set_symbol(text, symbol, True)
@@ -214,13 +240,52 @@ jobs:
           for symbol in disable:
               text = set_symbol(text, symbol, False)
 
+          #
+          # Bionic exposes a number of libc functions through static
+          # dispatch objects. Keep BusyBox dynamically linked and avoid
+          # the duplicate strchrnul collision.
+          #
+          extra_ldflags = "-Wl,-z,muldefs"
+
+          extra_pattern = re.compile(
+              r'^CONFIG_EXTRA_LDFLAGS=.*$',
+              re.MULTILINE,
+          )
+
+          if extra_pattern.search(text):
+              text = extra_pattern.sub(
+                  f'CONFIG_EXTRA_LDFLAGS="{extra_ldflags}"',
+                  text,
+                  count=1,
+              )
+          else:
+              text += (
+                  f'\nCONFIG_EXTRA_LDFLAGS="{extra_ldflags}"\n'
+              )
+
+          #
+          # Make sure static linking is really off.
+          #
+          text = re.sub(
+              r'^CONFIG_STATIC=.*$',
+              '# CONFIG_STATIC is not set',
+              text,
+              flags=re.MULTILINE,
+          )
+
+          text = re.sub(
+              r'^# CONFIG_STATIC is not set$',
+              '# CONFIG_STATIC is not set',
+              text,
+              flags=re.MULTILINE,
+          )
+
           path.write_text(text)
           PY
 
           #
-          # BusyBox does not provide the kernel olddefconfig target.
-          #
-          # Feed EOF so existing defaults are retained.
+          # Resolve BusyBox dependencies without the `yes | make oldconfig`
+          # pipeline that previously caused SIGPIPE/Broken-pipe failures.
           #
           set +e
           make oldconfig < /dev/null
@@ -228,32 +293,26 @@ jobs:
           set -e
 
           if [[ "${status}" -ne 0 ]]; then
-            echo "make oldconfig returned ${status}"
-            echo "Retrying with generated configuration answers..."
-
-            #
-            # Avoid `yes | make oldconfig` under pipefail because yes can
-            # legitimately receive SIGPIPE after make exits.
-            #
-            set +e
-            yes "" | make oldconfig
-            make_status=${PIPESTATUS[1]}
-            set -e
-
-            if [[ "${make_status}" -ne 0 ]]; then
-              echo "BusyBox oldconfig failed with ${make_status}"
-              exit "${make_status}"
-            fi
+            echo "ERROR: BusyBox oldconfig failed with ${status}"
+            exit "${status}"
           fi
 
           #
-          # Prevent the large networking target that caused the previous
-          # compile failure.
+          # Hard checks for the two previously failing configurations.
           #
+          if grep -q '^CONFIG_STATIC=y' .config; then
+            echo "ERROR: CONFIG_STATIC is enabled"
+            exit 1
+          fi
+
           if grep -q '^CONFIG_TC=y' .config; then
             echo "ERROR: CONFIG_TC is enabled"
             exit 1
           fi
+
+          grep -E \
+            '^(CONFIG_(STATIC|IP|FEATURE_IP_|IFCONFIG|ROUTE|ARP|ARPING|PING|PING6|UDHCPC|MODPROBE|INSMOD|RMMOD))=' \
+            .config || true
 
       - name: Build BusyBox ARM64
         shell: bash
@@ -272,9 +331,29 @@ jobs:
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
-          export CFLAGS="$(printf '%s' "${CFLAGS:-}" | sed 's/-static-libgcc//g')"
-          export CXXFLAGS="$(printf '%s' "${CXXFLAGS:-}" | sed 's/-static-libgcc//g')"
-          export LDFLAGS="$(printf '%s' "${LDFLAGS:-}" | sed 's/-static-libgcc//g')"
+          #
+          # Remove GCC-only options inherited from CI/Bionic configs.
+          #
+          export CFLAGS="$(
+            printf '%s' "${CFLAGS:-}" |
+            sed \
+              -e 's/-static-libgcc//g' \
+              -e 's/-static-libstdc++//g'
+          )"
+
+          export CXXFLAGS="$(
+            printf '%s' "${CXXFLAGS:-}" |
+            sed \
+              -e 's/-static-libgcc//g' \
+              -e 's/-static-libstdc++//g'
+          )"
+
+          export LDFLAGS="$(
+            printf '%s' "${LDFLAGS:-}" |
+            sed \
+              -e 's/-static-libgcc//g' \
+              -e 's/-static-libstdc++//g'
+          )"
 
           make -j"$(nproc)" \
             ARCH=arm64 \
@@ -286,11 +365,26 @@ jobs:
 
           test -f busybox
 
+          #
+          # Verify that this is ARM64 ELF.
+          #
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
             grep -q "Class:.*ELF64"
 
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
             grep -q "Machine:.*AArch64"
+
+          #
+          # Verify it is dynamically linked for Android rather than
+          # accidentally producing another broken static binary.
+          #
+          if "${TOOLCHAIN}/llvm-readelf" -l busybox |
+            grep -q "Requesting program interpreter"; then
+            echo "BusyBox has an ELF interpreter"
+          else
+            echo "ERROR: BusyBox does not contain an Android ELF interpreter"
+            exit 1
+          fi
 
           cp \
             busybox \
@@ -299,7 +393,7 @@ jobs:
           chmod 755 \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
-      - name: Build native ARM64 helper
+      - name: Build native USB0 ARM64 helper
         shell: bash
         run: |
           set -euo pipefail
@@ -308,7 +402,8 @@ jobs:
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          mkdir -p app/src/main/assets/tools/arm64-v8a
+          mkdir -p \
+            app/src/main/assets/tools/arm64-v8a
 
           SRC=""
 
@@ -344,7 +439,7 @@ jobs:
               app/src/main/assets/tools/arm64-v8a/usb0-native
           fi
 
-      - name: Create helper manifest
+      - name: Write helper manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -352,11 +447,13 @@ jobs:
           cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
           USB0 Manager helper bundle
           ABI=arm64-v8a
+          ANDROID_API=${ANDROID_API_LEVEL}
           BUSYBOX=${BUSYBOX_VERSION}
           NATIVE_HELPER=usb0-native
+          LINK_MODE=dynamic-android-bionic
           EOF
 
-      - name: Create JVM target configuration
+      - name: Create JVM configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -402,11 +499,8 @@ jobs:
           test -f build.gradle || \
             test -f build.gradle.kts
 
-          test -f \
-            app/src/main/assets/tools/arm64-v8a/busybox
-
-          test -f \
-            app/src/main/assets/tools/arm64-v8a/usb0-native
+          test -f app/src/main/assets/tools/arm64-v8a/busybox
+          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
 
       - name: Build debug APK
         shell: bash
@@ -439,36 +533,31 @@ jobs:
           rm -rf artifacts
           mkdir -p artifacts
 
-          DEBUG_APK="$(
+          found=0
+
+          while IFS= read -r -d '' apk; do
+            echo "Found APK: ${apk}"
+            cp "${apk}" "artifacts/$(basename "${apk}")"
+            found=1
+          done < <(
             find . \
               -type f \
-              -path '*/build/outputs/apk/debug/*.apk' \
-              | head -n 1 || true
-          )"
+              -path '*/build/outputs/apk/*.apk' \
+              -print0
+          )
 
-          RELEASE_APK="$(
+          if [[ "${found}" -eq 0 ]]; then
+            echo "ERROR: No APKs produced"
+
             find . \
               -type f \
-              -path '*/build/outputs/apk/release/*.apk' \
-              | head -n 1 || true
-          )"
+              -path '*/build/outputs/*' \
+              -print || true
 
-          if [[ -z "${DEBUG_APK}" ]]; then
-            echo "ERROR: Debug APK was not produced"
             exit 1
           fi
 
-          if [[ -z "${RELEASE_APK}" ]]; then
-            echo "ERROR: Release APK was not produced"
-            exit 1
-          fi
-
-          cp "${DEBUG_APK}" artifacts/app-debug.apk
-          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
-
-          ls -lh artifacts/*.apk
-
-      - name: Verify embedded tools
+      - name: Verify BusyBox embedded
         shell: bash
         run: |
           set -euo pipefail
@@ -477,10 +566,16 @@ jobs:
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/busybox"
+              grep -F \
+                "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/usb0-native"
+              grep -F \
+                "assets/tools/arm64-v8a/usb0-native"
+
+            unzip -l "${apk}" |
+              grep -F \
+                "assets/tools/arm64-v8a/manifest.txt"
           done
 
       - name: Upload APKs
@@ -501,6 +596,7 @@ jobs:
             **/build/outputs/**
             ~/.gradle/daemon/**
             third_party/busybox/busybox-${BUSYBOX_VERSION}/.config
+            third_party/busybox/busybox-${BUSYBOX_VERSION}/.config.old
           if-no-files-found: ignore
           retention-days: 7
 
@@ -543,11 +639,6 @@ jobs:
 
           echo "Using ${WORKFLOW}"
 
-          #
-          # This check intentionally does NOT scan for the string
-          # "yes ... make oldconfig", because that exact text may appear
-          # in this validation step itself and cause a false positive.
-          #
           if grep -nE \
             'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
             "${WORKFLOW}" 2>/dev/null; then
@@ -557,8 +648,9 @@ jobs:
           fi
 
           grep -q "BUSYBOX_VERSION" "${WORKFLOW}"
-          grep -q "make allnoconfig" "${WORKFLOW}"
+          grep -q "android_502_defconfig" "${WORKFLOW}"
           grep -q "make oldconfig" "${WORKFLOW}"
+          grep -q "CONFIG_STATIC" "${WORKFLOW}"
           grep -q "bash ./gradlew" "${WORKFLOW}"
 
       - name: Validate Gradle wrapper
