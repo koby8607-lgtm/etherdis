@@ -28,14 +28,32 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools"
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            "platforms;android-30" \
+            "build-tools;35.0.0" \
+            "ndk;${NDK_VERSION}"
+
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -47,34 +65,31 @@ jobs:
             unzip \
             zip
 
-      - name: Install Android NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-30" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
-          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
-
       - name: Prepare BusyBox source
         shell: bash
         run: |
           set -euo pipefail
 
           rm -rf busybox-src
-          mkdir -p busybox-src
+          rm -f busybox.tar.bz2
 
           curl -L --fail --retry 5 \
             "https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2" \
             -o busybox.tar.bz2
 
           tar -xjf busybox.tar.bz2
-          mv "busybox-${BUSYBOX_VERSION}" busybox-src
+
+          mv \
+            "busybox-${BUSYBOX_VERSION}" \
+            busybox-src
+
           rm -f busybox.tar.bz2
 
       - name: Patch BusyBox for ARM64 Android
         shell: bash
         run: |
           set -euo pipefail
+
           cd busybox-src
 
           python3 - <<'PY'
@@ -83,20 +98,13 @@ jobs:
           p = Path("libbb/hash_md5_sha.c")
           s = p.read_text()
 
-          old = """#if ENABLE_SHA1_HWACCEL
-              process_block = sha1_process_block64_shaNI;
-          #endif
-          """
-
-          new = """#if ENABLE_SHA1_HWACCEL
-          # if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
-              process_block = sha1_process_block64_shaNI;
-          # endif
-          #endif
-          """
-
           if "sha1_process_block64_shaNI" in s and "__i386__" not in s:
-              s = s.replace(old, new)
+              s = s.replace(
+                  "process_block = sha1_process_block64_shaNI;",
+                  "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
+                  "        process_block = sha1_process_block64_shaNI;\n"
+                  "#endif"
+              )
 
           p.write_text(s)
           PY
@@ -105,6 +113,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd busybox-src
 
           make allnoconfig
@@ -203,6 +212,7 @@ jobs:
           for line in lines:
               if line.startswith("CONFIG_") and "=" in line:
                   key = line.split("=", 1)[0]
+
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -210,6 +220,7 @@ jobs:
 
               if line.startswith("# CONFIG_") and line.endswith(" is not set"):
                   key = line[2:-11]
+
                   if key in wanted:
                       out.append(f"{key}={wanted[key]}")
                       seen.add(key)
@@ -224,19 +235,16 @@ jobs:
           path.write_text("\n".join(out) + "\n")
           PY
 
-          make oldconfig </dev/null || {
-            echo "BusyBox oldconfig failed"
-            exit 1
-          }
+          make oldconfig </dev/null
 
       - name: Build BusyBox for Android ARM64
         shell: bash
         run: |
           set -euo pipefail
+
           cd busybox-src
 
-          NDK="${ANDROID_NDK_ROOT}"
-          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TOOLCHAIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           export PATH="${TOOLCHAIN}:${PATH}"
 
@@ -250,9 +258,14 @@ jobs:
           export CXXFLAGS="${CXXFLAGS:-}"
           export LDFLAGS="${LDFLAGS:-}"
 
-          CFLAGS="$(printf '%s' "$CFLAGS" | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
-          CXXFLAGS="$(printf '%s' "$CXXFLAGS" | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
-          LDFLAGS="$(printf '%s' "$LDFLAGS" | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
+          CFLAGS="$(printf '%s' "$CFLAGS" \
+            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
+
+          CXXFLAGS="$(printf '%s' "$CXXFLAGS" \
+            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
+
+          LDFLAGS="$(printf '%s' "$LDFLAGS" \
+            | sed 's/-static-libgcc//g; s/-static-libstdc++//g')"
 
           export CFLAGS
           export CXXFLAGS
@@ -266,61 +279,70 @@ jobs:
             STRIP="$STRIP"
 
           file busybox
-          readelf -h busybox | grep -E "Class:.*ELF64|Machine:.*AArch64"
-          readelf -l busybox | grep -q "Requesting program interpreter" || {
-            echo "BusyBox is unexpectedly static"
-            exit 1
-          }
 
-      - name: Install embedded tools
+          readelf -h busybox | grep -E \
+            "Class:.*ELF64|Machine:.*AArch64"
+
+          readelf -l busybox \
+            | grep -q "Requesting program interpreter"
+
+      - name: Install embedded ARM64 tools
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p app/src/main/assets/tools/arm64-v8a
-          cp busybox-src/busybox app/src/main/assets/tools/arm64-v8a/busybox
-          chmod 755 app/src/main/assets/tools/arm64-v8a/busybox
+          mkdir -p \
+            app/src/main/assets/tools/arm64-v8a
+
+          cp \
+            busybox-src/busybox \
+            app/src/main/assets/tools/arm64-v8a/busybox
+
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/busybox
 
           if [ -f app/src/main/jni/arm64-v8a/usb0-native ]; then
-            cp app/src/main/jni/arm64-v8a/usb0-native \
+            cp \
+              app/src/main/jni/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
-            chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
           elif [ -f app/src/main/cpp/arm64-v8a/usb0-native ]; then
-            cp app/src/main/cpp/arm64-v8a/usb0-native \
+            cp \
+              app/src/main/cpp/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
-            chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
           else
-            cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
+            cat > \
+              app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
-          exec "$(dirname "$0")/busybox" "$@"
+          SELF="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          exec "$SELF/busybox" "$@"
           EOF
-            chmod 755 app/src/main/assets/tools/arm64-v8a/usb0-native
           fi
 
-          cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
+          chmod 755 \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
+
+          cat > \
+            app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
           ARCH=arm64-v8a
-          BUSYBOX_VERSION=${BUSYBOX_VERSION}
           ANDROID_API=30
+          BUSYBOX_VERSION=${BUSYBOX_VERSION}
           STATIC=NO
           SHA1_HWACCEL=NO
           SHA256_HWACCEL=NO
           TC=NO
           EOF
 
-      - name: Fix Gradle permissions and JVM targets
+      - name: Prepare Gradle
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod 755 ./gradlew 2>/dev/null || true
+          chmod 755 ./gradlew
 
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
           android.useAndroidX=true
           kotlin.code.style=official
-          EOF
-
-          cat > build.gradle.kts.tmp <<'EOF'
           EOF
 
       - name: Build APK
@@ -342,15 +364,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          APK="$(find . -type f \( -name '*-debug.apk' -o -name '*-release.apk' \) | head -n 1)"
+          APKS="$(find . -type f -name "*.apk")"
 
-          test -n "$APK"
+          if [ -z "$APKS" ]; then
+            echo "No APK produced"
+            exit 1
+          fi
 
-          unzip -l "$APK" | grep -q "assets/tools/arm64-v8a/busybox"
-          unzip -l "$APK" | grep -q "assets/tools/arm64-v8a/usb0-native"
-          unzip -l "$APK" | grep -q "assets/tools/arm64-v8a/manifest.txt"
+          while IFS= read -r APK; do
+            echo "Checking $APK"
 
-          echo "Verified APK: $APK"
+            unzip -l "$APK" \
+              | grep -q "assets/tools/arm64-v8a/busybox"
+
+            unzip -l "$APK" \
+              | grep -q "assets/tools/arm64-v8a/usb0-native"
+
+            unzip -l "$APK" \
+              | grep -q "assets/tools/arm64-v8a/manifest.txt"
+
+          done <<< "$APKS"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -378,7 +411,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate workflow YAML
+      - name: Validate workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -387,26 +420,33 @@ jobs:
           from pathlib import Path
           import sys
 
-          workflows = sorted(Path(".github/workflows").glob("*.yml"))
-          workflows += sorted(Path(".github/workflows").glob("*.yaml"))
+          directory = Path(".github/workflows")
+
+          workflows = sorted(directory.glob("*.yml"))
+          workflows += sorted(directory.glob("*.yaml"))
 
           if not workflows:
               print("No workflow files found")
               sys.exit(1)
 
-          print("Workflow files:")
-          for wf in workflows:
-              print(f" - {wf}")
+          for workflow in workflows:
+              text = workflow.read_text()
 
-              text = wf.read_text()
-
-              if "sdkmanager \"tools\"" in text:
-                  print(f"ERROR: obsolete Android SDK tools package in {wf}")
+              if "sdkmanager tools" in text:
+                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
                   sys.exit(1)
 
-              if "setup-android@v2" in text:
-                  print(f"ERROR: obsolete setup-android action in {wf}")
+              if "packages: 'tools" in text:
+                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
                   sys.exit(1)
 
-          print("Workflow source validation passed")
+              if 'packages: "tools' in text:
+                  print(f"ERROR: deprecated SDK package 'tools' found in {workflow}")
+                  sys.exit(1)
+
+              if "android-actions/setup-android@v2" in text:
+                  print(f"ERROR: obsolete setup-android@v2 in {workflow}")
+                  sys.exit(1)
+
+          print("Workflow validation passed")
           PY
