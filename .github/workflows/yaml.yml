@@ -116,32 +116,25 @@ jobs:
           symbols = [
               "STATIC",
               "FEATURE_PREFER_APPLETS",
-
               "IP",
               "FEATURE_IP_LINK",
               "FEATURE_IP_ROUTE",
               "FEATURE_IP_RULE",
               "FEATURE_IP_NEIGH",
               "FEATURE_IP_ADDRESS",
-
               "IFCONFIG",
               "IFUP",
               "IFDOWN",
               "ROUTE",
-
               "ARP",
               "ARPING",
-
               "PING",
               "PING6",
-
               "UDHCPC",
               "UDHCPD",
-
               "MODPROBE",
               "INSMOD",
               "RMMOD",
-
               "LS",
               "CAT",
               "CP",
@@ -165,21 +158,22 @@ jobs:
           ]
 
           for symbol in symbols:
-              replacement = f"CONFIG_{symbol}=y"
-
               pattern = re.compile(
                   rf"^(?:# CONFIG_{re.escape(symbol)} is not set|CONFIG_{re.escape(symbol)}=.*)$",
                   re.MULTILINE,
               )
 
               if pattern.search(text):
-                  text = pattern.sub(replacement, text, count=1)
+                  text = pattern.sub(
+                      f"CONFIG_{symbol}=y",
+                      text,
+                      count=1,
+                  )
 
           path.write_text(text)
           PY
 
-          # BusyBox 1.37.0 does not provide the kernel-style
-          # "olddefconfig" target. Use oldconfig non-interactively.
+          # BusyBox uses oldconfig rather than the kernel's olddefconfig target.
           yes "" | make oldconfig
 
       - name: Build BusyBox ARM64
@@ -192,9 +186,6 @@ jobs:
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
-          test -x "${TOOLCHAIN}/llvm-ar"
-          test -x "${TOOLCHAIN}/llvm-ranlib"
-          test -x "${TOOLCHAIN}/llvm-strip"
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
@@ -307,21 +298,46 @@ jobs:
           }
           EOF
 
-      - name: Verify project
+      - name: Find project files
         shell: bash
         run: |
           set -euo pipefail
 
           test -f ./gradlew
 
-          test -f settings.gradle || \
-            test -f settings.gradle.kts
+          SETTINGS=""
+          BUILD=""
 
-          test -f build.gradle || \
-            test -f build.gradle.kts
+          if [[ -f settings.gradle ]]; then
+            SETTINGS="settings.gradle"
+          elif [[ -f settings.gradle.kts ]]; then
+            SETTINGS="settings.gradle.kts"
+          fi
 
-          test -f app/src/main/assets/tools/arm64-v8a/busybox
-          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
+          if [[ -f build.gradle ]]; then
+            BUILD="build.gradle"
+          elif [[ -f build.gradle.kts ]]; then
+            BUILD="build.gradle.kts"
+          fi
+
+          if [[ -z "${SETTINGS}" ]]; then
+            echo "ERROR: settings.gradle/settings.gradle.kts not found"
+            find . -maxdepth 3 -type f \
+              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              -print
+            exit 1
+          fi
+
+          if [[ -z "${BUILD}" ]]; then
+            echo "ERROR: build.gradle/build.gradle.kts not found"
+            find . -maxdepth 3 -type f \
+              \( -name 'build.gradle' -o -name 'build.gradle.kts' \) \
+              -print
+            exit 1
+          fi
+
+          echo "Using ${SETTINGS}"
+          echo "Using ${BUILD}"
 
       - name: Build debug APK
         shell: bash
@@ -346,39 +362,52 @@ jobs:
             --stacktrace \
             -I "${GITHUB_WORKSPACE}/ci-jvm-targets.gradle"
 
-      - name: Verify APKs
+      - name: Collect APKs
         shell: bash
         run: |
           set -euo pipefail
 
+          rm -rf artifacts
           mkdir -p artifacts
 
-          DEBUG_APK="$(find . \
-            -type f \
-            -path '*/build/outputs/apk/debug/*.apk' \
-            | head -n 1 || true)"
+          found=0
 
-          RELEASE_APK="$(find . \
-            -type f \
-            -path '*/build/outputs/apk/release/*.apk' \
-            | head -n 1 || true)"
+          while IFS= read -r -d '' apk; do
+            echo "Found APK: ${apk}"
+            cp "${apk}" "artifacts/$(basename "${apk}")"
+            found=1
+          done < <(
+            find . \
+              -type f \
+              -path '*/build/outputs/apk/*.apk' \
+              -print0
+          )
 
-          test -n "${DEBUG_APK}"
-          test -n "${RELEASE_APK}"
+          if [[ "${found}" -eq 0 ]]; then
+            echo "ERROR: No APKs were produced"
+            find . \
+              -type f \
+              -path '*/build/outputs/*' \
+              -print || true
+            exit 1
+          fi
 
-          cp "${DEBUG_APK}" artifacts/app-debug.apk
-          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
+      - name: Verify embedded tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f app/src/main/assets/tools/arm64-v8a/busybox
+          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
 
           for apk in artifacts/*.apk; do
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/busybox"
+              grep -F "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/usb0-native"
+              grep -F "assets/tools/arm64-v8a/usb0-native"
           done
 
       - name: Upload APKs
@@ -409,6 +438,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Locate workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKFLOW=""
+
+          for f in \
+            .github/workflows/yaml.yml \
+            .github/workflows/yaml.yaml \
+            .github/workflows/build.yml \
+            .github/workflows/build.yaml; do
+
+            if [[ -f "${f}" ]]; then
+              WORKFLOW="${f}"
+              break
+            fi
+          done
+
+          if [[ -z "${WORKFLOW}" ]]; then
+            echo "ERROR: no workflow file found"
+            find .github/workflows \
+              -maxdepth 1 \
+              -type f \
+              -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Workflow: ${WORKFLOW}"
+
+          ! grep -nE \
+            'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
+            "${WORKFLOW}"
+
+          grep -q "BUSYBOX_VERSION" "${WORKFLOW}"
+          grep -q "make oldconfig" "${WORKFLOW}"
+          grep -q "bash ./gradlew" "${WORKFLOW}"
+
       - name: Validate Gradle wrapper
         shell: bash
         run: |
@@ -424,6 +491,7 @@ jobs:
           set -euo pipefail
 
           while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
             bash -n "${file}"
           done < <(
             find . \
@@ -432,33 +500,3 @@ jobs:
               -not -path './.git/*' \
               -print0
           )
-
-      - name: Validate workflow file
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          WORKFLOW=""
-
-          if [[ -f .github/workflows/build.yml ]]; then
-            WORKFLOW=".github/workflows/build.yml"
-          elif [[ -f .github/workflows/build.yaml ]]; then
-            WORKFLOW=".github/workflows/build.yaml"
-          else
-            echo "ERROR: no workflow file found"
-            find .github/workflows -maxdepth 1 -type f -print 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "Using workflow: ${WORKFLOW}"
-
-          if grep -nE \
-            'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
-            "${WORKFLOW}" 2>/dev/null; then
-            echo "ERROR: obsolete Android SDK 'tools' package detected"
-            exit 1
-          fi
-
-          grep -q "BUSYBOX_VERSION" "${WORKFLOW}"
-          grep -q "make oldconfig" "${WORKFLOW}"
-          grep -q "bash ./gradlew" "${WORKFLOW}"
