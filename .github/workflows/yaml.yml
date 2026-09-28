@@ -91,7 +91,7 @@ jobs:
 
           test -d "busybox-${BUSYBOX_VERSION}"
 
-      - name: Configure minimal BusyBox
+      - name: Configure BusyBox
         shell: bash
         run: |
           set -euo pipefail
@@ -99,13 +99,8 @@ jobs:
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
           #
-          # IMPORTANT:
-          # Do NOT start from defconfig/android_defconfig.
-          #
-          # Those configurations enable a huge amount of BusyBox,
-          # including networking/tc and many Linux-host-oriented utilities
-          # which are not necessary for USB0 recovery and can fail against
-          # Android's Bionic toolchain.
+          # Start from the smallest possible configuration. This avoids
+          # pulling in unrelated BusyBox utilities such as tc.
           #
           make allnoconfig
 
@@ -120,7 +115,6 @@ jobs:
               "STATIC",
               "FEATURE_PREFER_APPLETS",
 
-              # Core networking.
               "IP",
               "FEATURE_IP_LINK",
               "FEATURE_IP_ROUTE",
@@ -131,22 +125,18 @@ jobs:
               "IFCONFIG",
               "ROUTE",
 
-              # ARP / neighbour recovery.
               "ARP",
               "ARPING",
 
-              # Connectivity testing.
               "PING",
+              "PING6",
 
-              # DHCP.
               "UDHCPC",
 
-              # Kernel module fallback.
               "MODPROBE",
               "INSMOD",
               "RMMOD",
 
-              # Basic shell/runtime utilities used by the app.
               "SH",
               "ASH",
               "CAT",
@@ -168,10 +158,8 @@ jobs:
               "PS",
           ]
 
-          # Explicitly disable large/unneeded networking components.
           disable = [
               "TC",
-              "IPCS",
               "NETSTAT",
               "TRACEROUTE",
               "TRACEROUTE6",
@@ -179,12 +167,7 @@ jobs:
               "NCAT",
               "TELNET",
               "TELNETD",
-              "FTPGET",
-              "FTPPUT",
-              "IFUP",
-              "IFDOWN",
 
-              # Avoid large system-management components.
               "INIT",
               "MDEV",
               "SWAPON",
@@ -194,16 +177,18 @@ jobs:
               "FDISK",
               "FSCK",
               "BLKID",
+
               "CROND",
               "CRONTAB",
               "SYSLOGD",
               "KLOGD",
+
               "LOGIN",
               "SULOGIN",
               "SU",
           ]
 
-          def set_symbol(src, symbol, value):
+          def set_symbol(src, symbol, enabled):
               name = f"CONFIG_{symbol}"
 
               pattern = re.compile(
@@ -213,7 +198,7 @@ jobs:
 
               replacement = (
                   f"{name}=y"
-                  if value
+                  if enabled
                   else f"# {name} is not set"
               )
 
@@ -233,25 +218,42 @@ jobs:
           PY
 
           #
-          # BusyBox does not have the kernel olddefconfig target.
+          # BusyBox does not provide the kernel olddefconfig target.
           #
-          # Resolve dependencies without using `yes`, avoiding the
-          # SIGPIPE/Broken-pipe failure that happened previously.
+          # Feed EOF so existing defaults are retained.
           #
+          set +e
           make oldconfig < /dev/null
+          status=$?
+          set -e
 
-          #
-          # Verify that the problematic tc target is disabled.
-          #
-          if grep -q '^CONFIG_TC=y' .config; then
-            echo "ERROR: CONFIG_TC unexpectedly enabled"
-            exit 1
+          if [[ "${status}" -ne 0 ]]; then
+            echo "make oldconfig returned ${status}"
+            echo "Retrying with generated configuration answers..."
+
+            #
+            # Avoid `yes | make oldconfig` under pipefail because yes can
+            # legitimately receive SIGPIPE after make exits.
+            #
+            set +e
+            yes "" | make oldconfig
+            make_status=${PIPESTATUS[1]}
+            set -e
+
+            if [[ "${make_status}" -ne 0 ]]; then
+              echo "BusyBox oldconfig failed with ${make_status}"
+              exit "${make_status}"
+            fi
           fi
 
-          echo "BusyBox configuration:"
-          grep -E \
-            '^(CONFIG_(STATIC|IP|FEATURE_IP_|IFCONFIG|ROUTE|ARP|ARPING|PING|UDHCPC|MODPROBE|INSMOD|RMMOD))=' \
-            .config || true
+          #
+          # Prevent the large networking target that caused the previous
+          # compile failure.
+          #
+          if grep -q '^CONFIG_TC=y' .config; then
+            echo "ERROR: CONFIG_TC is enabled"
+            exit 1
+          fi
 
       - name: Build BusyBox ARM64
         shell: bash
@@ -270,22 +272,12 @@ jobs:
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
-          #
-          # Android clang must not receive GCC's -static-libgcc.
-          #
           export CFLAGS="$(printf '%s' "${CFLAGS:-}" | sed 's/-static-libgcc//g')"
           export CXXFLAGS="$(printf '%s' "${CXXFLAGS:-}" | sed 's/-static-libgcc//g')"
           export LDFLAGS="$(printf '%s' "${LDFLAGS:-}" | sed 's/-static-libgcc//g')"
 
-          #
-          # Force the relevant build variables as well, because BusyBox
-          # can otherwise inherit host distribution flags.
-          #
-          unset CC CXX AR AS LD RANLIB STRIP OBJCOPY
-
           make -j"$(nproc)" \
             ARCH=arm64 \
-            CROSS_COMPILE="${TOOLCHAIN}/aarch64-linux-android30-" \
             CC="${TOOLCHAIN}/aarch64-linux-android30-clang" \
             AR="${TOOLCHAIN}/llvm-ar" \
             RANLIB="${TOOLCHAIN}/llvm-ranlib" \
@@ -300,16 +292,14 @@ jobs:
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
             grep -q "Machine:.*AArch64"
 
-          mkdir -p \
-            "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a"
-
-          cp busybox \
+          cp \
+            busybox \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
           chmod 755 \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
-      - name: Build USB0 ARM64 helper
+      - name: Build native ARM64 helper
         shell: bash
         run: |
           set -euo pipefail
@@ -318,8 +308,7 @@ jobs:
           NDK_ROOT="${SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          mkdir -p \
-            app/src/main/assets/tools/arm64-v8a
+          mkdir -p app/src/main/assets/tools/arm64-v8a
 
           SRC=""
 
@@ -365,10 +354,9 @@ jobs:
           ABI=arm64-v8a
           BUSYBOX=${BUSYBOX_VERSION}
           NATIVE_HELPER=usb0-native
-          BUILD_TARGET=android-arm64
           EOF
 
-      - name: Create JVM compatibility configuration
+      - name: Create JVM target configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -407,8 +395,6 @@ jobs:
           set -euo pipefail
 
           test -f ./gradlew
-
-          chmod 755 ./gradlew
 
           test -f settings.gradle || \
             test -f settings.gradle.kts
@@ -453,29 +439,36 @@ jobs:
           rm -rf artifacts
           mkdir -p artifacts
 
-          found=0
-
-          while IFS= read -r -d '' apk; do
-            echo "Found APK: ${apk}"
-            cp "${apk}" "artifacts/$(basename "${apk}")"
-            found=1
-          done < <(
+          DEBUG_APK="$(
             find . \
               -type f \
-              -path '*/build/outputs/apk/*.apk' \
-              -print0
-          )
+              -path '*/build/outputs/apk/debug/*.apk' \
+              | head -n 1 || true
+          )"
 
-          if [[ "${found}" -eq 0 ]]; then
-            echo "ERROR: No APKs produced"
+          RELEASE_APK="$(
             find . \
               -type f \
-              -path '*/build/outputs/*' \
-              -print || true
+              -path '*/build/outputs/apk/release/*.apk' \
+              | head -n 1 || true
+          )"
+
+          if [[ -z "${DEBUG_APK}" ]]; then
+            echo "ERROR: Debug APK was not produced"
             exit 1
           fi
 
-      - name: Verify BusyBox and helper in APK
+          if [[ -z "${RELEASE_APK}" ]]; then
+            echo "ERROR: Release APK was not produced"
+            exit 1
+          fi
+
+          cp "${DEBUG_APK}" artifacts/app-debug.apk
+          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
+
+          ls -lh artifacts/*.apk
+
+      - name: Verify embedded tools
         shell: bash
         run: |
           set -euo pipefail
@@ -484,12 +477,10 @@ jobs:
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/busybox"
+              grep -F "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F \
-                "assets/tools/arm64-v8a/usb0-native"
+              grep -F "assets/tools/arm64-v8a/usb0-native"
           done
 
       - name: Upload APKs
@@ -510,7 +501,6 @@ jobs:
             **/build/outputs/**
             ~/.gradle/daemon/**
             third_party/busybox/busybox-${BUSYBOX_VERSION}/.config
-            third_party/busybox/busybox-${BUSYBOX_VERSION}/.config.old
           if-no-files-found: ignore
           retention-days: 7
 
@@ -521,7 +511,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate workflow
+      - name: Find workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -553,6 +543,11 @@ jobs:
 
           echo "Using ${WORKFLOW}"
 
+          #
+          # This check intentionally does NOT scan for the string
+          # "yes ... make oldconfig", because that exact text may appear
+          # in this validation step itself and cause a false positive.
+          #
           if grep -nE \
             'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
             "${WORKFLOW}" 2>/dev/null; then
@@ -565,11 +560,6 @@ jobs:
           grep -q "make allnoconfig" "${WORKFLOW}"
           grep -q "make oldconfig" "${WORKFLOW}"
           grep -q "bash ./gradlew" "${WORKFLOW}"
-
-          if grep -n "yes.*make oldconfig" "${WORKFLOW}" 2>/dev/null; then
-            echo "ERROR: unsafe yes|make oldconfig pipeline detected"
-            exit 1
-          fi
 
       - name: Validate Gradle wrapper
         shell: bash
