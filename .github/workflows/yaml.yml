@@ -53,6 +53,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             clang \
@@ -78,7 +79,11 @@ jobs:
             -o busybox.tar.bz2
 
           tar -xjf busybox.tar.bz2
-          mv "busybox-${BUSYBOX_VERSION}" busybox-src
+
+          mv \
+            "busybox-${BUSYBOX_VERSION}" \
+            busybox-src
+
           rm -f busybox.tar.bz2
 
       - name: Patch BusyBox for ARM64 Android
@@ -94,12 +99,15 @@ jobs:
           p = Path("libbb/hash_md5_sha.c")
           s = p.read_text()
 
-          s = s.replace(
-              "process_block = sha1_process_block64_shaNI;",
-              "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
-              "        process_block = sha1_process_block64_shaNI;\n"
-              "#endif"
-          )
+          old = "process_block = sha1_process_block64_shaNI;"
+
+          if old in s:
+              s = s.replace(
+                  old,
+                  "#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))\n"
+                  "        process_block = sha1_process_block64_shaNI;\n"
+                  "#endif"
+              )
 
           p.write_text(s)
           PY
@@ -121,7 +129,6 @@ jobs:
 
           wanted = {
               "CONFIG_DESKTOP": "y",
-              "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
               "CONFIG_LONG_OPTS": "y",
 
               "CONFIG_FEATURE_SUID": "y",
@@ -206,6 +213,9 @@ jobs:
               "CONFIG_FEATURE_RTMINMAX": "n",
               "CONFIG_FEATURE_BUFFERS_GO_ON_STACK": "n",
               "CONFIG_FEATURE_BUFFERS_USE_MALLOC": "n",
+              "CONFIG_FEATURE_BUFFERS_GO_IN_BSS": "y",
+
+              "CONFIG_PIVOT_ROOT": "n",
           }
 
           out = []
@@ -216,7 +226,13 @@ jobs:
                   key = line.split("=", 1)[0]
 
                   if key in wanted:
-                      out.append(f"{key}={wanted[key]}")
+                      value = wanted[key]
+
+                      if value == "n":
+                          out.append(f"# {key} is not set")
+                      else:
+                          out.append(f"{key}={value}")
+
                       seen.add(key)
                       continue
 
@@ -224,7 +240,13 @@ jobs:
                   key = line[2:-11]
 
                   if key in wanted:
-                      out.append(f"{key}={wanted[key]}")
+                      value = wanted[key]
+
+                      if value == "n":
+                          out.append(f"# {key} is not set")
+                      else:
+                          out.append(f"{key}={value}")
+
                       seen.add(key)
                       continue
 
@@ -232,22 +254,38 @@ jobs:
 
           for key, value in wanted.items():
               if key not in seen:
-                  out.append(f"{key}={value}")
+                  if value == "n":
+                      out.append(f"# {key} is not set")
+                  else:
+                      out.append(f"{key}={value}")
 
           path.write_text("\n".join(out) + "\n")
           PY
 
-          # Resolve every remaining kconfig prompt using its default.
-          # Avoid the interactive EOF failure seen previously.
-          yes '' | make oldconfig >/tmp/busybox-oldconfig.log 2>&1
-          rc=${PIPESTATUS[1]}
+          # Resolve any remaining BusyBox Kconfig prompts.
+          #
+          # IMPORTANT:
+          # Do not use `yes | make oldconfig` while `set -e` is active.
+          # `yes` normally receives SIGPIPE once BusyBox exits and returns
+          # 141/1, which previously caused the GitHub step to fail even
+          # when make itself completed successfully.
+          set +e
+
+          yes "" | make oldconfig 2>&1 | tee /tmp/busybox-oldconfig.log
+
+          PIPE_STATUS=("${PIPESTATUS[@]}")
+          MAKE_RC="${PIPE_STATUS[1]}"
+
+          set -e
 
           cat /tmp/busybox-oldconfig.log
 
-          if [ "$rc" -ne 0 ]; then
-            echo "BusyBox oldconfig failed with exit code $rc"
-            exit "$rc"
+          if [ "${MAKE_RC}" -ne 0 ]; then
+            echo "BusyBox oldconfig failed with exit code ${MAKE_RC}"
+            exit "${MAKE_RC}"
           fi
+
+          echo "BusyBox oldconfig completed successfully."
 
       - name: Build BusyBox for Android ARM64
         shell: bash
@@ -262,13 +300,8 @@ jobs:
 
           export CC="${TOOLCHAIN}/aarch64-linux-android30-clang"
           export HOSTCC="cc"
-
-          # Use Ubuntu binutils for BusyBox static archives.
-          # These archives contain ARM64 ELF objects but ar/ranlib
-          # themselves are architecture-independent.
           export AR="$(command -v ar)"
           export RANLIB="$(command -v ranlib)"
-
           export STRIP="${TOOLCHAIN}/llvm-strip"
 
           export CFLAGS="${CFLAGS:-}"
@@ -290,14 +323,11 @@ jobs:
 
           echo "Compiler: $CC"
           echo "Archiver: $AR"
-          echo "RANLIB:   $RANLIB"
+          echo "Ranlib:   $RANLIB"
           echo "Strip:    $STRIP"
 
           "$CC" --version
-          "$AR" --version
-          "$RANLIB" --version
 
-          # Build serially so the first real failure is visible.
           make V=1 -j1 \
             CC="$CC" \
             HOSTCC="$HOSTCC" \
@@ -322,17 +352,20 @@ jobs:
 
           mkdir -p app/src/main/assets/tools/arm64-v8a
 
-          cp busybox-src/busybox \
+          cp \
+            busybox-src/busybox \
             app/src/main/assets/tools/arm64-v8a/busybox
 
           chmod 755 \
             app/src/main/assets/tools/arm64-v8a/busybox
 
           if [ -f app/src/main/jni/arm64-v8a/usb0-native ]; then
-            cp app/src/main/jni/arm64-v8a/usb0-native \
+            cp \
+              app/src/main/jni/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
           elif [ -f app/src/main/cpp/arm64-v8a/usb0-native ]; then
-            cp app/src/main/cpp/arm64-v8a/usb0-native \
+            cp \
+              app/src/main/cpp/arm64-v8a/usb0-native \
               app/src/main/assets/tools/arm64-v8a/usb0-native
           else
             cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
@@ -345,7 +378,8 @@ jobs:
           chmod 755 \
             app/src/main/assets/tools/arm64-v8a/usb0-native
 
-          cat > app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
+          cat > \
+            app/src/main/assets/tools/arm64-v8a/manifest.txt <<EOF
           ARCH=arm64-v8a
           ANDROID_API=30
           BUSYBOX_VERSION=${BUSYBOX_VERSION}
@@ -353,8 +387,7 @@ jobs:
           SHA1_HWACCEL=NO
           SHA256_HWACCEL=NO
           TC=NO
-          AR=GNU-binutils
-          RANLIB=GNU-binutils
+          PIVOT_ROOT=NO
           EOF
 
       - name: Prepare Gradle
@@ -427,6 +460,7 @@ jobs:
           path: |
             busybox-src/busybox
             busybox-src/.config
+            /tmp/busybox-oldconfig.log
             app/src/main/assets/tools/arm64-v8a/manifest.txt
 
   validate-workflow:
