@@ -37,7 +37,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK components
+      - name: Install Android SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -67,7 +67,7 @@ jobs:
             third_party \
             build-tools
 
-      - name: Download BusyBox source
+      - name: Download BusyBox
         shell: bash
         run: |
           set -euo pipefail
@@ -116,25 +116,32 @@ jobs:
           symbols = [
               "STATIC",
               "FEATURE_PREFER_APPLETS",
+
               "IP",
               "FEATURE_IP_LINK",
               "FEATURE_IP_ROUTE",
               "FEATURE_IP_RULE",
               "FEATURE_IP_NEIGH",
               "FEATURE_IP_ADDRESS",
+
               "IFCONFIG",
               "IFUP",
               "IFDOWN",
               "ROUTE",
+
               "ARP",
               "ARPING",
+
               "PING",
               "PING6",
+
               "UDHCPC",
               "UDHCPD",
+
               "MODPROBE",
               "INSMOD",
               "RMMOD",
+
               "LS",
               "CAT",
               "CP",
@@ -173,8 +180,30 @@ jobs:
           path.write_text(text)
           PY
 
-          # BusyBox uses oldconfig rather than the kernel's olddefconfig target.
+          #
+          # BusyBox does not have the kernel-style olddefconfig target.
+          #
+          # Do NOT use:
+          #   yes "" | make oldconfig
+          #
+          # because yes receives SIGPIPE when make exits, and with
+          # "set -o pipefail" that produces:
+          #   yes: standard output: Broken pipe
+          #
+          # Capture the make status separately so a harmless SIGPIPE
+          # from yes cannot fail the workflow.
+          #
+          set +e
+
           yes "" | make oldconfig
+          make_status=${PIPESTATUS[1]}
+
+          set -e
+
+          if [[ "${make_status}" -ne 0 ]]; then
+            echo "BusyBox make oldconfig failed with exit code ${make_status}"
+            exit "${make_status}"
+          fi
 
       - name: Build BusyBox ARM64
         shell: bash
@@ -186,6 +215,9 @@ jobs:
           TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           test -x "${TOOLCHAIN}/aarch64-linux-android30-clang"
+          test -x "${TOOLCHAIN}/llvm-ar"
+          test -x "${TOOLCHAIN}/llvm-ranlib"
+          test -x "${TOOLCHAIN}/llvm-strip"
 
           cd "third_party/busybox/busybox-${BUSYBOX_VERSION}"
 
@@ -204,7 +236,8 @@ jobs:
           "${TOOLCHAIN}/llvm-readelf" -h busybox |
             grep -q "Machine:.*AArch64"
 
-          cp busybox \
+          cp \
+            busybox \
             "${GITHUB_WORKSPACE}/app/src/main/assets/tools/arm64-v8a/busybox"
 
           chmod 755 \
@@ -242,6 +275,14 @@ jobs:
 
             chmod 755 \
               app/src/main/assets/tools/arm64-v8a/usb0-native
+
+            "${TOOLCHAIN}/llvm-readelf" -h \
+              app/src/main/assets/tools/arm64-v8a/usb0-native |
+              grep -q "Class:.*ELF64"
+
+            "${TOOLCHAIN}/llvm-readelf" -h \
+              app/src/main/assets/tools/arm64-v8a/usb0-native |
+              grep -q "Machine:.*AArch64"
           else
             cat > app/src/main/assets/tools/arm64-v8a/usb0-native <<'EOF'
           #!/system/bin/sh
@@ -298,46 +339,20 @@ jobs:
           }
           EOF
 
-      - name: Find project files
+      - name: Verify project
         shell: bash
         run: |
           set -euo pipefail
 
           test -f ./gradlew
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f build.gradle || test -f build.gradle.kts
 
-          SETTINGS=""
-          BUILD=""
+          test -f \
+            app/src/main/assets/tools/arm64-v8a/busybox
 
-          if [[ -f settings.gradle ]]; then
-            SETTINGS="settings.gradle"
-          elif [[ -f settings.gradle.kts ]]; then
-            SETTINGS="settings.gradle.kts"
-          fi
-
-          if [[ -f build.gradle ]]; then
-            BUILD="build.gradle"
-          elif [[ -f build.gradle.kts ]]; then
-            BUILD="build.gradle.kts"
-          fi
-
-          if [[ -z "${SETTINGS}" ]]; then
-            echo "ERROR: settings.gradle/settings.gradle.kts not found"
-            find . -maxdepth 3 -type f \
-              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
-              -print
-            exit 1
-          fi
-
-          if [[ -z "${BUILD}" ]]; then
-            echo "ERROR: build.gradle/build.gradle.kts not found"
-            find . -maxdepth 3 -type f \
-              \( -name 'build.gradle' -o -name 'build.gradle.kts' \) \
-              -print
-            exit 1
-          fi
-
-          echo "Using ${SETTINGS}"
-          echo "Using ${BUILD}"
+          test -f \
+            app/src/main/assets/tools/arm64-v8a/usb0-native
 
       - name: Build debug APK
         shell: bash
@@ -367,47 +382,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf artifacts
           mkdir -p artifacts
 
-          found=0
-
-          while IFS= read -r -d '' apk; do
-            echo "Found APK: ${apk}"
-            cp "${apk}" "artifacts/$(basename "${apk}")"
-            found=1
-          done < <(
+          DEBUG_APK="$(
             find . \
               -type f \
-              -path '*/build/outputs/apk/*.apk' \
-              -print0
-          )
+              -path '*/build/outputs/apk/debug/*.apk' \
+              | head -n 1 || true
+          )"
 
-          if [[ "${found}" -eq 0 ]]; then
-            echo "ERROR: No APKs were produced"
+          RELEASE_APK="$(
             find . \
               -type f \
-              -path '*/build/outputs/*' \
-              -print || true
-            exit 1
-          fi
+              -path '*/build/outputs/apk/release/*.apk' \
+              | head -n 1 || true
+          )"
+
+          test -n "${DEBUG_APK}"
+          test -n "${RELEASE_APK}"
+
+          cp "${DEBUG_APK}" artifacts/app-debug.apk
+          cp "${RELEASE_APK}" artifacts/app-release-unsigned.apk
 
       - name: Verify embedded tools
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f app/src/main/assets/tools/arm64-v8a/busybox
-          test -f app/src/main/assets/tools/arm64-v8a/usb0-native
-
           for apk in artifacts/*.apk; do
             echo "Checking ${apk}"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/busybox"
+              grep -F \
+                "assets/tools/arm64-v8a/busybox"
 
             unzip -l "${apk}" |
-              grep -F "assets/tools/arm64-v8a/usb0-native"
+              grep -F \
+                "assets/tools/arm64-v8a/usb0-native"
           done
 
       - name: Upload APKs
@@ -418,7 +429,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload diagnostics on failure
+      - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -459,18 +470,24 @@ jobs:
 
           if [[ -z "${WORKFLOW}" ]]; then
             echo "ERROR: no workflow file found"
+
             find .github/workflows \
               -maxdepth 1 \
               -type f \
               -print 2>/dev/null || true
+
             exit 1
           fi
 
-          echo "Workflow: ${WORKFLOW}"
+          echo "Workflow found: ${WORKFLOW}"
 
-          ! grep -nE \
+          if grep -nE \
             'packages:.*(^|[[:space:]])tools([[:space:]]|$)|^[[:space:]]*-[[:space:]]*tools[[:space:]]*$' \
-            "${WORKFLOW}"
+            "${WORKFLOW}" 2>/dev/null; then
+
+            echo "ERROR: obsolete Android SDK 'tools' package detected"
+            exit 1
+          fi
 
           grep -q "BUSYBOX_VERSION" "${WORKFLOW}"
           grep -q "make oldconfig" "${WORKFLOW}"
